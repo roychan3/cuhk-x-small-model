@@ -1,0 +1,6 @@
+# Dependencies for multimodal feature extraction and logistic regression.
+numpy>=2.0,<3
+scipy>=1.14,<2
+scikit-learn>=1.5,<2
+Pillow>=10,<13
+joblib>=1.4,<2

@@ -192,12 +192,52 @@ docker run --rm -p 127.0.0.1:8501:8501 \
 Then open <http://localhost:8501>. See `visualization/README.md` for the
 module-specific commands and layout.
 
-## Tests
+## Logistic-regression baseline
 
-The suite uses the standard library only, needs no dataset, and runs in
-milliseconds. Run it from the repository root:
+The `modeling/` module provides an extensible four-modality training framework
+using Depth Color, IR, IMU, and Skeleton features. It strictly filters
+incomplete training clips, validates by held-out participant groups, shares a
+feature cache across registered algorithms, and writes submissions in test CSV
+order. Logistic regression is the initial registered algorithm.
+
+Install and run it from the repository root:
 
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r modeling/requirements.txt
+python -m modeling.train \
+  --algorithm logistic_regression \
+  --dataset-root /path/to/small-model \
+  --n-jobs 8
+```
+
+See `modeling/README.md` for feature definitions, filtering rules, artifacts,
+and prediction-only usage.
+
+## Tests
+
+No test needs the dataset, and the whole suite runs in well under a second.
+Run it from the repository root:
+
+```bash
+python3 -m unittest discover -s tests -t .
+```
+
+There are two suites with different requirements:
+
+| Suite | Requires | Behavior without the requirement |
+|-------|----------|----------------------------------|
+| `tests/test_visualization_dataset.py` | standard library only | always runs |
+| `tests/test_modeling.py` | `modeling/requirements.txt` | skipped, reported as `OK (skipped=1)` |
+
+So a bare interpreter reports `Ran 8 tests ... OK (skipped=1)`, while an
+interpreter with NumPy, Pillow, and scikit-learn reports `Ran 14 tests ... OK`.
+A skip is expected, not a failure. Install the modeling extras to run
+everything:
+
+```bash
+pip install -r modeling/requirements.txt
 python3 -m unittest discover -s tests -t .
 ```
 
