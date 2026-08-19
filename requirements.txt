@@ -1,0 +1,3 @@
+# Repository-wide development dependencies.
+# Add training/evaluation requirement files here as those modules are introduced.
+-r visualization/requirements.txt
