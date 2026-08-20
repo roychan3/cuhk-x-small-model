@@ -29,6 +29,7 @@ Given a multimodal clip, predict its action class (`action_id`, **0–39, 40 cla
 │   ├── app.py
 │   ├── dataset.py
 │   ├── playback.py
+│   ├── predictions.py
 │   ├── build_manifest.py
 │   └── requirements.txt
 ├── tests/                    # Repository tests
@@ -124,6 +125,8 @@ This repository includes a Streamlit dashboard with:
 - synchronized Depth Color, IR, and Thermal frames with play, pause, restart,
   speed, and manual scrubbing controls;
 - animated 3D skeletons, IMU magnitude traces, and radar point clouds;
+- predicted test actions loaded from any `path,prediction` submission CSV,
+  including an all-clip distribution/table and labels while clips play;
 - missing-modality, empty-sensor, and timestamp-alignment diagnostics;
 - **Algorithm comparison** page comparing every `artifacts/*/validation.json` (leaderboard, bar chart, confusion matrix + Δ recall, folds, metadata) — same source as `python -m modeling.compare`, and its CSV download is byte-identical to that command's output.
 
@@ -135,6 +138,12 @@ source .venv/bin/activate
 pip install -r requirements.txt
 CUHKX_DATASET_ROOT=/path/to/small-model streamlit run visualization/app.py
 ```
+
+After `modeling.train` or `modeling.predict` creates a `*_submission.csv` under
+`outputs/`, the dashboard automatically selects the newest one. The sidebar also accepts
+another CSV path or a direct upload. In `Clip explorer`, test clips show the
+predicted action ID and name in both the selector and a banner above playback;
+`Overview` shows prediction coverage, class distribution, and a per-clip table.
 
 ### Dataset root
 
@@ -241,18 +250,20 @@ Run it from the repository root:
 python3 -m unittest discover -s tests -t .
 ```
 
-There are four suites with different requirements:
+There are five suites with different requirements:
 
 | Suite | Tests | Requires | Behavior without the requirement |
 |-------|-------|----------|----------------------------------|
 | `tests/test_visualization_dataset.py` | 15 | standard library only | always runs |
+| `tests/test_predictions.py` | 7 | standard library only | always runs |
 | `tests/test_comparison_format.py` | 13 | standard library only | always runs; its 2 CLI-parity tests skip without `modeling/requirements.txt` |
 | `tests/test_algorithm_comparison.py` | 16 | `visualization/requirements.txt` + `numpy` (for confusion-matrix math) | collapses to 1 skip |
 | `tests/test_modeling.py` | 11 | `modeling/requirements.txt` | collapses to 1 skip |
 
-So a bare interpreter reports `Ran 30 tests ... OK (skipped=4)`, while an
-interpreter with `visualization` + `modeling` deps reports `Ran 55 tests ... OK`.
-A skip is expected, not a failure. Install the extras to run
+So a bare interpreter reports `Ran 37 tests ... OK (skipped=4)`, while an
+interpreter with `visualization` + `modeling` deps reports `Ran 62 tests ... OK`
+(`skipped=1` when the optional real validation artifact is absent). A skip is
+expected, not a failure. Install the extras to run
 everything:
 
 ```bash

@@ -12,6 +12,12 @@ import sys
 from collections import Counter
 from pathlib import Path, PurePosixPath
 
+# Streamlit adds this script's directory to sys.path, but not necessarily the
+# repository root when launched by absolute path or from another directory.
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
+
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -32,6 +38,13 @@ from visualization.dataset import (
     resolve_dataset_root,
 )
 from visualization.playback import normalized_timeline_position, playback_interval, timeline_frame_count
+from visualization.predictions import (
+    PredictionTable,
+    discover_prediction_csvs,
+    load_action_mapping,
+    load_prediction_csv,
+    parse_prediction_csv,
+)
 
 
 st.set_page_config(page_title="CUHK-X Dataset Explorer", page_icon="🧭", layout="wide")
@@ -70,6 +83,10 @@ def pretty_action(value: object) -> str:
     if "_" in text and text.split("_", 1)[0].isdigit():
         text = text.split("_", 1)[1]
     return text.replace("_", " ")
+
+
+def prediction_label(action_id: object, action_name: object) -> str:
+    return f"{int(action_id):02d} · {pretty_action(action_name)}"
 
 
 def source_from_dict(data: dict[str, str]) -> DataSource:
@@ -181,6 +198,35 @@ def cached_payloads(source_data: dict[str, str], member_paths: tuple[str, ...]) 
     return read_members(source_from_dict(source_data), member_paths)
 
 
+@st.cache_data(show_spinner=False)
+def cached_action_mapping(
+    mapping_path: str,
+    mapping_mtime_ns: int,
+    mapping_size: int,
+) -> dict[int, str]:
+    del mapping_mtime_ns, mapping_size
+    return load_action_mapping(mapping_path)
+
+
+@st.cache_data(show_spinner=False)
+def cached_prediction_file(
+    prediction_path: str,
+    prediction_mtime_ns: int,
+    prediction_size: int,
+    action_mapping: tuple[tuple[int, str], ...],
+) -> PredictionTable:
+    del prediction_mtime_ns, prediction_size
+    return load_prediction_csv(prediction_path, dict(action_mapping))
+
+
+@st.cache_data(show_spinner=False)
+def cached_uploaded_predictions(
+    contents: bytes,
+    action_mapping: tuple[tuple[int, str], ...],
+) -> PredictionTable:
+    return parse_prediction_csv(contents.decode("utf-8-sig"), dict(action_mapping))
+
+
 def choose_member(paths: list[str], position: int) -> str | None:
     if not paths:
         return None
@@ -202,6 +248,20 @@ def modality_coverage(frame: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def add_predictions(frame: pd.DataFrame, predictions: PredictionTable) -> pd.DataFrame:
+    """Attach validated prediction IDs and names to matching test clips."""
+
+    enriched = frame.copy()
+    action_ids = {clip_id: item.action_id for clip_id, item in predictions.by_clip.items()}
+    action_names = {clip_id: item.action_name for clip_id, item in predictions.by_clip.items()}
+    test_rows = enriched["split"] == "test"
+    enriched["prediction_action_id"] = (
+        enriched["clip_id"].map(action_ids).where(test_rows).astype("Int64")
+    )
+    enriched["prediction_action_name"] = enriched["clip_id"].map(action_names).where(test_rows)
+    return enriched
+
+
 def render_overview(frame: pd.DataFrame) -> None:
     st.header("Dataset overview")
     train = frame[frame["split"] == "train"].copy()
@@ -213,6 +273,67 @@ def render_overview(frame: pd.DataFrame) -> None:
     metric_columns[2].metric("Actions", int(train["action_id"].nunique()) if not train.empty else 0)
     metric_columns[3].metric("Users", int(train["user"].nunique()) if not train.empty else 0)
     metric_columns[4].metric("All modalities", f"{complete / len(frame):.1%}" if len(frame) else "—")
+
+    if "prediction_action_id" in test.columns:
+        predicted = test.dropna(subset=["prediction_action_id"]).copy()
+        if not predicted.empty:
+            st.subheader("Test predictions")
+            prediction_metrics = st.columns(3)
+            prediction_metrics[0].metric("Predicted clips", f"{len(predicted):,}")
+            prediction_metrics[1].metric(
+                "Visible coverage",
+                f"{len(predicted) / len(test):.1%}" if len(test) else "—",
+            )
+            prediction_metrics[2].metric(
+                "Predicted actions",
+                int(predicted["prediction_action_id"].nunique()),
+            )
+
+            distribution = (
+                predicted.groupby(["prediction_action_id", "prediction_action_name"], dropna=False)
+                .size()
+                .reset_index(name="clips")
+                .sort_values("prediction_action_id")
+            )
+            distribution["action"] = distribution.apply(
+                lambda row: prediction_label(
+                    row["prediction_action_id"], row["prediction_action_name"]
+                ),
+                axis=1,
+            )
+            figure = px.bar(
+                distribution,
+                x="action",
+                y="clips",
+                color="clips",
+                color_continuous_scale="Teal",
+            )
+            figure.update_layout(xaxis_tickangle=-55, coloraxis_showscale=False, height=430)
+            st.plotly_chart(figure, width="stretch")
+
+            with st.expander("Predictions by test clip"):
+                prediction_rows = test[
+                    ["clip_id", "prediction_action_id", "prediction_action_name"]
+                ].sort_values("clip_id")
+                prediction_rows = prediction_rows.rename(
+                    columns={
+                        "prediction_action_id": "action_id",
+                        "prediction_action_name": "action_name",
+                    }
+                )
+                prediction_rows["action"] = prediction_rows.apply(
+                    lambda row: (
+                        prediction_label(row["action_id"], row["action_name"])
+                        if pd.notna(row["action_id"])
+                        else "No prediction"
+                    ),
+                    axis=1,
+                )
+                st.dataframe(
+                    prediction_rows[["clip_id", "action_id", "action"]],
+                    hide_index=True,
+                    width="stretch",
+                )
 
     left, right = st.columns((1.45, 1))
     with left:
@@ -532,13 +653,51 @@ def render_clip_explorer(frame: pd.DataFrame, sources: dict[str, dict[str, str]]
         users = sorted(filtered["user"].dropna().unique(), key=natural_key)
         user = st.selectbox("User", users)
         filtered = filtered[filtered["user"] == user]
+    elif split == "test" and "prediction_action_id" in filtered.columns:
+        predicted = filtered.dropna(subset=["prediction_action_id"])
+        if not predicted.empty:
+            prediction_options = {
+                prediction_label(action_id, group["prediction_action_name"].iloc[0]): int(action_id)
+                for action_id, group in predicted.groupby("prediction_action_id")
+            }
+            selected_prediction = st.selectbox(
+                "Predicted action",
+                ["All test clips", *prediction_options],
+            )
+            if selected_prediction != "All test clips":
+                filtered = filtered[
+                    filtered["prediction_action_id"].fillna(-1).astype(int)
+                    == prediction_options[selected_prediction]
+                ]
 
     clip_ids = sorted(filtered["clip_id"].dropna().unique(), key=natural_key)
     if not clip_ids:
         st.info("No clips match the filters.")
         return
-    clip_id = st.selectbox("Clip", clip_ids)
+
+    def clip_label(clip_id: str) -> str:
+        if split != "test" or "prediction_action_id" not in filtered.columns:
+            return clip_id
+        matches = filtered[filtered["clip_id"] == clip_id]
+        if matches.empty or pd.isna(matches.iloc[0].get("prediction_action_id")):
+            return f"{clip_id} · no prediction"
+        item = matches.iloc[0]
+        return (
+            f"{clip_id} · "
+            f"{prediction_label(item['prediction_action_id'], item['prediction_action_name'])}"
+        )
+
+    clip_id = st.selectbox("Clip", clip_ids, format_func=clip_label)
     row = filtered[filtered["clip_id"] == clip_id].iloc[0]
+
+    if split == "test" and "prediction_action_id" in row.index:
+        if pd.notna(row.get("prediction_action_id")):
+            st.success(
+                "Predicted action: "
+                f"{prediction_label(row['prediction_action_id'], row['prediction_action_name'])}"
+            )
+        else:
+            st.warning("This test clip has no prediction in the selected CSV.")
 
     counts = st.columns(6)
     for column, modality in zip(counts, MODALITIES):
@@ -787,11 +946,16 @@ def render_background_manifest_status(
 
 def main() -> None:
     st.title("CUHK-X Small Model Dataset Explorer")
-    st.caption("Overview, synchronized multimodal samples, and data-quality diagnostics.")
+    st.caption(
+        "Overview, synchronized multimodal samples, predicted test actions, "
+        "and data-quality diagnostics."
+    )
 
-    repository_root = Path(__file__).resolve().parents[1]
+    repository_root = REPOSITORY_ROOT
     generated_manifest = repository_root / "artifacts" / "cuhkx_manifest.parquet"
     generated_progress = repository_root / "artifacts" / "cuhkx_manifest.progress.json"
+    prediction_candidates = discover_prediction_csvs(repository_root)
+    default_prediction_csv = str(prediction_candidates[0]) if prediction_candidates else ""
 
     # A fragment sets this flag when its background builder finishes. Apply
     # widget state before those widgets are instantiated on the next full run.
@@ -826,6 +990,8 @@ def main() -> None:
         st.session_state["saved_manifest_input"] = default_manifest
     if "use_manifest_checkbox" not in st.session_state:
         st.session_state["use_manifest_checkbox"] = True
+    if "prediction_csv_input" not in st.session_state:
+        st.session_state["prediction_csv_input"] = default_prediction_csv
     with st.sidebar:
         dataset_root = st.text_input("Dataset root", default_root, key="dataset_root_input")
         # Pre-filled with the generated parquet when it exists. Clearing the
@@ -852,6 +1018,20 @@ def main() -> None:
             value=True,
             disabled=bool(effective_manifest),
             key="deep_test_checkbox",
+        )
+        st.subheader("Test predictions")
+        prediction_csv = st.text_input(
+            "Predictions CSV (optional)",
+            key="prediction_csv_input",
+            help=(
+                "A path,prediction CSV such as outputs/logreg_submission.csv. "
+                "The newest *_submission.csv under outputs/ is selected automatically."
+            ),
+        ).strip()
+        uploaded_prediction = st.file_uploader(
+            "Or upload predictions CSV",
+            type=("csv",),
+            help="An uploaded file overrides the path above for this session.",
         )
         if st.button("Clear cached index", key="clear_cache_main"):
             st.cache_data.clear()
@@ -895,6 +1075,57 @@ def main() -> None:
         st.stop()
 
     frame = pd.DataFrame(records)
+
+    prediction_table: PredictionTable | None = None
+    prediction_source = ""
+    if prediction_csv or uploaded_prediction is not None:
+        mapping_candidates = (
+            repository_root / "Training" / "class_mapping.csv",
+            root / "Training" / "class_mapping.csv",
+        )
+        mapping_path = next((path for path in mapping_candidates if path.is_file()), None)
+        try:
+            if mapping_path is None:
+                raise FileNotFoundError(
+                    "Training/class_mapping.csv was not found in the repository or dataset root"
+                )
+            mapping_stat = mapping_path.stat()
+            action_mapping = cached_action_mapping(
+                str(mapping_path), mapping_stat.st_mtime_ns, mapping_stat.st_size
+            )
+            mapping_items = tuple(sorted(action_mapping.items()))
+            if uploaded_prediction is not None:
+                prediction_table = cached_uploaded_predictions(
+                    uploaded_prediction.getvalue(), mapping_items
+                )
+                prediction_source = uploaded_prediction.name
+            else:
+                prediction_path = Path(prediction_csv).expanduser()
+                if not prediction_path.is_absolute():
+                    prediction_path = repository_root / prediction_path
+                prediction_stat = prediction_path.stat()
+                prediction_table = cached_prediction_file(
+                    str(prediction_path),
+                    prediction_stat.st_mtime_ns,
+                    prediction_stat.st_size,
+                    mapping_items,
+                )
+                prediction_source = str(prediction_path)
+            frame = add_predictions(frame, prediction_table)
+        except Exception as exc:
+            st.sidebar.error(f"Could not load predictions: {exc}")
+
+    if prediction_table is not None:
+        visible_test_ids = set(frame.loc[frame["split"] == "test", "clip_id"].astype(str))
+        visible_predictions = len(visible_test_ids & set(prediction_table.by_clip))
+        st.sidebar.caption(
+            f"Loaded {len(prediction_table.by_clip):,} predictions from {prediction_source}. "
+            f"Matched {visible_predictions:,}/{len(visible_test_ids):,} visible test clips."
+        )
+        if prediction_table.blank_predictions:
+            st.sidebar.warning(
+                f"Ignored {prediction_table.blank_predictions:,} row(s) with blank predictions."
+            )
     if partial_manifest and background_process is not None:
         render_background_manifest_status(
             background_process,

@@ -20,6 +20,7 @@ RUN python -m pip install --upgrade pip \
     && python -m pip install -r visualization/requirements.txt
 
 COPY visualization visualization
+COPY Training/class_mapping.csv Training/class_mapping.csv
 
 RUN useradd --create-home --uid 10001 appuser \
     && chown -R appuser:appuser /app

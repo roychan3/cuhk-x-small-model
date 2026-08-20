@@ -8,6 +8,7 @@ dataset and comparing training algorithms.
 - `app.py`: Streamlit application — Overview, Clip explorer, Data quality, and Algorithm comparison pages.
 - `algorithm_comparison.py`: Algorithm comparison page (reads `artifacts/*/validation.json` from `modeling.train`/`modeling.compare`; no `scikit-learn` needed).
 - `comparison_format.py`: standard-library-only definition of the comparison table (columns, row builder, run labels), shared with `modeling/compare.py` so the page and the CLI cannot drift.
+- `predictions.py`: standard-library prediction CSV validation, clip-ID normalization, and action-name mapping.
 - `playback.py`: synchronized timeline and playback timing helpers.
 - `dataset.py`: standard-library dataset discovery, indexing, quality checks, archive access, and manifest generation.
 - `build_manifest.py`: command-line manifest generator.
@@ -23,6 +24,21 @@ source .venv/bin/activate
 pip install -r visualization/requirements.txt
 CUHKX_DATASET_ROOT=/path/to/small-model streamlit run visualization/app.py
 ```
+
+### Test prediction visualization
+
+The dashboard reads the same `path,prediction` CSV produced by
+`python -m modeling.train` and `python -m modeling.predict`. It automatically
+selects the newest `*_submission.csv` under `outputs/`; use `Predictions CSV`
+in the sidebar to choose another path, or upload a CSV directly.
+
+For test data, `Clip explorer` adds a predicted-action filter, includes the
+action ID/name beside every clip ID, and keeps the selected prediction visible
+above synchronized playback. `Overview` adds prediction coverage, a class
+distribution chart, and a table of every indexed test clip and its prediction.
+Blank prediction rows are ignored and reported; duplicate clips, non-integer
+IDs, unknown action IDs, and malformed headers are rejected with a sidebar
+error instead of being silently displayed.
 
 Build a reusable manifest (strongly recommended — makes Overview/Clip explorer/Data quality load in ~0.2 s instead of scanning the full dataset and running `deep_test` JSON checks):
 
@@ -97,4 +113,6 @@ write into `artifacts`. Docker Desktop on macOS remaps ownership already.
 
 Open <http://localhost:8501>. The container treats `/data` as the dataset
 root and never copies the dataset into the image. The writable `/app/artifacts`
-mount persists the generated manifest and progress state on the host.
+mount persists the generated manifest and progress state on the host. Upload a
+prediction CSV in the sidebar, or additionally mount a host output directory
+at `/app/outputs` to enable automatic discovery inside the container.
