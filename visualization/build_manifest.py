@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import sys
+import uuid
 from pathlib import Path
 
 
@@ -45,25 +48,78 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Read training CSV/JSON payloads when the source is merged or extracted.",
     )
+    parser.add_argument(
+        "--progress-file",
+        type=Path,
+        default=None,
+        help="Optional JSON file updated with background build progress.",
+    )
     return parser.parse_args()
+
+
+def write_progress(path: Path | None, **values: object) -> None:
+    if path is None:
+        return
+    path = path.expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.stem}.{uuid.uuid4().hex}.tmp{path.suffix}")
+    try:
+        temporary.write_text(json.dumps(values, sort_keys=True), encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def main() -> int:
     args = parse_args()
     dataset_root = resolve_dataset_root(args.dataset_root)
-    records, sources = build_dataset_manifest(
-        dataset_root,
-        deep_test=not args.no_deep_test,
-        deep_train=args.deep_train,
-    )
-    if not sources:
-        print(f"No dataset sources found under {dataset_root}", file=sys.stderr)
-        return 2
-    output = write_manifest(records, args.output)
-    source_summary = ", ".join(f"{split}={source.kind}" for split, source in sources.items())
-    print(f"Wrote {len(records):,} clips to {output}")
-    print(f"Sources: {source_summary}")
-    return 0
+    try:
+        def report_progress(phase: str, processed: int, total: int) -> None:
+            write_progress(
+                args.progress_file,
+                state="building",
+                phase=phase,
+                processed=processed,
+                total=total,
+            )
+
+        records, sources = build_dataset_manifest(
+            dataset_root,
+            deep_test=not args.no_deep_test,
+            deep_train=args.deep_train,
+            progress_callback=report_progress if args.progress_file else None,
+        )
+        if not sources:
+            write_progress(
+                args.progress_file,
+                state="error",
+                message=f"No dataset sources found under {dataset_root}",
+            )
+            print(f"No dataset sources found under {dataset_root}", file=sys.stderr)
+            return 2
+        write_progress(
+            args.progress_file,
+            state="building",
+            phase="writing",
+            processed=1,
+            total=1,
+        )
+        output = write_manifest(records, args.output)
+        write_progress(
+            args.progress_file,
+            state="complete",
+            phase="complete",
+            processed=1,
+            total=1,
+            clips=len(records),
+        )
+        source_summary = ", ".join(f"{split}={source.kind}" for split, source in sources.items())
+        print(f"Wrote {len(records):,} clips to {output}")
+        print(f"Sources: {source_summary}")
+        return 0
+    except Exception as exc:
+        write_progress(args.progress_file, state="error", message=str(exc))
+        raise
 
 
 if __name__ == "__main__":

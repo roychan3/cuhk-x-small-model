@@ -161,7 +161,7 @@ python -m visualization.build_manifest \
   --output artifacts/cuhkx_manifest.parquet
 ```
 
-The dashboard pre-fills the sidebar with `artifacts/cuhkx_manifest.parquet` when it exists; clear the field or untick `Use saved manifest` to force a live scan. The `Algorithm comparison` page does not need the dataset at all — it reads only `artifacts/*/validation.json`. `Clip explorer` now indexes only the selected clip (~0.02 s) instead of all 3k+ clips (19.5 s train / 2.1 s test). CSV and JSON manifests are also supported (use `.csv` / `.json` suffix).
+The dashboard pre-fills the sidebar with `artifacts/cuhkx_manifest.parquet` when it exists. If it is missing and the dataset is extracted, the dashboard first loads a representative 200 clips, builds the complete manifest in a separate process, shows exact file-count progress, and automatically switches to it when ready. A banner marks the view as partial, and quality checks that the shallow preview cannot run show `—` rather than `0`. Only extracted splits can be sampled, so a split still held in an archive is named in that banner and appears once the complete index is ready. Untick `Load 200 clips first` to use the original blocking live scan. Untick `Use saved manifest` to rebuild a stale manifest: the dashboard shows the preview again, runs a fresh build, and switches back when it finishes. If a build fails, `Clear cached index` retries it. The `Algorithm comparison` page does not need the dataset at all — it reads only `artifacts/*/validation.json`. `Clip explorer` indexes only the selected clip (~0.02 s) instead of all 3k+ clips (19.5 s train / 2.1 s test). CSV and JSON manifests are also supported (use `.csv` / `.json` suffix).
 
 ### Multipart training archive
 
@@ -180,15 +180,31 @@ symlinks.
 ### Docker
 
 The Docker image contains the visualization module only. Mount the dataset
-read-only at `/data` so it is not copied into the image. For the `Algorithm comparison` page mount `artifacts` as well so it sees real scores (`artifacts/logreg/validation.json` etc.):
+read-only at `/data` so it is not copied into the image. Mount `artifacts`
+writable so the progressive loader can save `cuhkx_manifest.parquet` and its
+progress file, and so the cache persists after the container is removed. The
+same mount also exposes algorithm reports such as
+`artifacts/logreg/validation.json`:
 
 ```bash
 docker build -t cuhkx-visualization .
+mkdir -p artifacts
 docker run --rm -p 127.0.0.1:8501:8501 \
   -v /path/to/small-model:/data:ro \
-  -v $(pwd)/artifacts:/app/artifacts:ro \
+  -v "$(pwd)/artifacts:/app/artifacts" \
   cuhkx-visualization
 ```
+
+On Linux add `--user "$(id -u):$(id -g)"`. The image runs as uid 10001, and a
+bind mount keeps the host directory's ownership, so without it the background
+builder cannot write into `artifacts`. Docker Desktop on macOS remaps ownership
+and needs no extra flag.
+
+Use `:ro` on the artifacts mount only when `cuhkx_manifest.parquet` has already
+been built and the dashboard will only consume existing manifests and
+validation reports. A read-only artifacts mount cannot run progressive cache
+generation or rebuild the manifest; the dashboard reports the failed build
+instead of stopping.
 
 Then open <http://localhost:8501>. See `visualization/README.md` for the
 module-specific commands and layout. Real scores from the reference run: `logistic_regression` `C=0.01` → `accuracy 0.4539, macro_f1 0.3896` on 2,785 clips.
@@ -229,13 +245,13 @@ There are four suites with different requirements:
 
 | Suite | Tests | Requires | Behavior without the requirement |
 |-------|-------|----------|----------------------------------|
-| `tests/test_visualization_dataset.py` | 10 | standard library only | always runs |
+| `tests/test_visualization_dataset.py` | 15 | standard library only | always runs |
 | `tests/test_comparison_format.py` | 13 | standard library only | always runs; its 2 CLI-parity tests skip without `modeling/requirements.txt` |
 | `tests/test_algorithm_comparison.py` | 16 | `visualization/requirements.txt` + `numpy` (for confusion-matrix math) | collapses to 1 skip |
 | `tests/test_modeling.py` | 11 | `modeling/requirements.txt` | collapses to 1 skip |
 
-So a bare interpreter reports `Ran 25 tests ... OK (skipped=4)`, while an
-interpreter with `visualization` + `modeling` deps reports `Ran 50 tests ... OK`.
+So a bare interpreter reports `Ran 30 tests ... OK (skipped=4)`, while an
+interpreter with `visualization` + `modeling` deps reports `Ran 55 tests ... OK`.
 A skip is expected, not a failure. Install the extras to run
 everything:
 

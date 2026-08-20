@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import subprocess
+import uuid
 import zipfile
 from collections import defaultdict
 from contextlib import contextmanager
@@ -342,14 +343,19 @@ def _natural_key(value: object) -> tuple[object, ...]:
     return tuple(int(part) if part.isdigit() else part.lower() for part in parts)
 
 
-def build_source_manifest(source: DataSource, deep: bool = False) -> list[dict[str, object]]:
-    """Build one compact, scalar-only record per logical clip."""
+def _build_manifest_from_members(
+    source: DataSource,
+    members: Iterable[Member],
+    *,
+    deep: bool = False,
+) -> list[dict[str, object]]:
+    """Build compact clip records from a bounded or complete member stream."""
 
     records: dict[str, dict[str, object]] = {}
     members_by_clip: dict[str, dict[str, list[ParsedMember]]] = defaultdict(lambda: defaultdict(list))
     timestamps: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
 
-    for member in iter_source_members(source):
+    for member in members:
         parsed = parse_member(source, member)
         if parsed is None:
             continue
@@ -420,20 +426,231 @@ def build_source_manifest(source: DataSource, deep: bool = False) -> list[dict[s
     )
 
 
+def build_source_manifest(source: DataSource, deep: bool = False) -> list[dict[str, object]]:
+    """Build one compact, scalar-only record per logical clip."""
+
+    return _build_manifest_from_members(source, iter_source_members(source), deep=deep)
+
+
+def count_source_members(source: DataSource) -> int:
+    """Count physical files efficiently for background progress reporting."""
+
+    if source.kind == "directory":
+        total = 0
+        pending = [source.path]
+        while pending:
+            current = pending.pop()
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    if entry.is_dir(follow_symlinks=False):
+                        pending.append(entry.path)
+                    elif entry.is_file(follow_symlinks=False):
+                        total += 1
+        return total
+    return sum(1 for _ in iter_source_members(source))
+
+
+def _members_with_progress(
+    source: DataSource,
+    callback: Callable[[int], None],
+) -> Iterator[Member]:
+    processed = 0
+    for processed, member in enumerate(iter_source_members(source), start=1):
+        yield member
+        if processed % 1_000 == 0:
+            callback(processed)
+    callback(processed)
+
+
+def _directory_clip_ids(source: DataSource) -> list[str]:
+    """Discover logical clip IDs using directory names rather than file scans."""
+
+    if source.kind != "directory":
+        raise ValueError("Fast initial clip discovery requires an extracted directory source")
+
+    root = Path(source.path)
+    if source.split == "test":
+        return sorted(
+            (
+                path.name
+                for path in root.iterdir()
+                if path.is_dir() and path.name.startswith("SM_test_")
+            ),
+            key=_natural_key,
+        )
+
+    clips_by_action: dict[str, list[str]] = defaultdict(list)
+    # One visual modality is enough to discover a representative initial set.
+    # Try the modalities in their normal display order in case Depth_Color is
+    # absent from a particular extracted copy.
+    for modality in MODALITIES:
+        modality_root = root / "data" / modality
+        if not modality_root.is_dir():
+            continue
+        action_dirs = sorted(
+            (path for path in modality_root.iterdir() if path.is_dir()),
+            key=lambda path: _natural_key(path.name),
+        )
+        for action_dir in action_dirs:
+            user_dirs = sorted(
+                (path for path in action_dir.iterdir() if path.is_dir()),
+                key=lambda path: _natural_key(path.name),
+            )
+            for user_dir in user_dirs:
+                trial_dirs = sorted(
+                    (path for path in user_dir.iterdir() if path.is_dir()),
+                    key=lambda path: _natural_key(path.name),
+                )
+                for trial_dir in trial_dirs:
+                    clips_by_action[action_dir.name].append(
+                        f"{action_dir.name}/{user_dir.name}/{trial_dir.name}"
+                    )
+        if clips_by_action:
+            break
+
+    # Round-robin across actions so the initial training view is useful instead
+    # of containing only the first few action directories.
+    ordered: list[str] = []
+    action_names = sorted(clips_by_action, key=_natural_key)
+    offset = 0
+    while True:
+        added = False
+        for action_name in action_names:
+            clips = clips_by_action[action_name]
+            if offset < len(clips):
+                ordered.append(clips[offset])
+                added = True
+        if not added:
+            break
+        offset += 1
+    return ordered
+
+
+def initial_clip_ids(source: DataSource, limit: int) -> list[str]:
+    """Choose a small, representative set of clips for progressive startup."""
+
+    if limit <= 0:
+        return []
+    clip_ids = _directory_clip_ids(source)
+    if len(clip_ids) <= limit:
+        return clip_ids
+    if source.split == "train":
+        return clip_ids[:limit]
+    if limit == 1:
+        return [clip_ids[0]]
+    # Spread test clips over the full ID range rather than showing only the
+    # lowest-numbered anonymous samples.
+    indices = [round(index * (len(clip_ids) - 1) / (limit - 1)) for index in range(limit)]
+    return [clip_ids[index] for index in indices]
+
+
+def _iter_directory_clip_members(source: DataSource, clip_ids: Iterable[str]) -> Iterator[Member]:
+    root = Path(source.path)
+    relative_root = root.parent
+    for clip_id in clip_ids:
+        for modality in MODALITIES:
+            clip_dir = (
+                root / "data" / modality / clip_id
+                if source.split == "train"
+                else root / clip_id / modality
+            )
+            if not clip_dir.is_dir():
+                continue
+            for path in clip_dir.rglob("*"):
+                if path.is_file():
+                    yield Member(path.relative_to(relative_root).as_posix(), path.stat().st_size)
+
+
+def build_initial_dataset_manifest(
+    dataset_root: str | Path,
+    *,
+    max_clips: int = 200,
+) -> tuple[list[dict[str, object]], dict[str, DataSource]]:
+    """Build a representative partial manifest without a full file scan.
+
+    The budget is divided evenly between available train and test directory
+    sources. Archive sources are omitted because finding complete clips inside
+    an archive requires scanning its full central directory.
+    """
+
+    sources = discover_sources(dataset_root)
+    progressive_sources = {
+        split: source for split, source in sources.items() if source.kind == "directory"
+    }
+    if not progressive_sources or max_clips <= 0:
+        return [], sources
+
+    split_names = [split for split in ("train", "test") if split in progressive_sources]
+    base, remainder = divmod(max_clips, len(split_names))
+    selected: dict[str, list[str]] = {}
+    for index, split in enumerate(split_names):
+        quota = base + int(index < remainder)
+        selected[split] = initial_clip_ids(progressive_sources[split], quota)
+
+    # If a small split cannot fill its quota, let the other split use the
+    # remaining budget.
+    remaining = max_clips - sum(len(values) for values in selected.values())
+    if remaining > 0:
+        for split in split_names:
+            existing = selected[split]
+            candidates = initial_clip_ids(progressive_sources[split], len(existing) + remaining)
+            existing_set = set(existing)
+            additions = [clip_id for clip_id in candidates if clip_id not in existing_set]
+            selected[split].extend(additions[:remaining])
+            remaining = max_clips - sum(len(values) for values in selected.values())
+            if remaining == 0:
+                break
+
+    records: list[dict[str, object]] = []
+    for split in split_names:
+        source = progressive_sources[split]
+        members = _iter_directory_clip_members(source, selected[split])
+        records.extend(_build_manifest_from_members(source, members, deep=False))
+    return records, sources
+
+
 def build_dataset_manifest(
     dataset_root: str | Path,
     *,
     deep_test: bool = True,
     deep_train: bool = False,
+    progress_callback: Callable[[str, int, int], None] | None = None,
 ) -> tuple[list[dict[str, object]], dict[str, DataSource]]:
     """Discover sources and build a combined train/test manifest."""
 
     sources = discover_sources(dataset_root)
+    source_counts: dict[str, int] = {}
+    if progress_callback is not None:
+        progress_callback("counting", 0, 0)
+        source_counts = {split: count_source_members(source) for split, source in sources.items()}
+        progress_callback("scanning", 0, sum(source_counts.values()))
+
     records: list[dict[str, object]] = []
-    if "train" in sources:
-        records.extend(build_source_manifest(sources["train"], deep=deep_train))
-    if "test" in sources:
-        records.extend(build_source_manifest(sources["test"], deep=deep_test))
+    processed_before = 0
+    for split in ("train", "test"):
+        if split not in sources:
+            continue
+        source = sources[split]
+        if progress_callback is None:
+            members = iter_source_members(source)
+        else:
+            total = sum(source_counts.values())
+            members = _members_with_progress(
+                source,
+                lambda processed, split=split, before=processed_before: progress_callback(
+                    split, before + processed, total
+                ),
+            )
+        records.extend(
+            _build_manifest_from_members(
+                source,
+                members,
+                deep=deep_train if split == "train" else deep_test,
+            )
+        )
+        if progress_callback is not None:
+            processed_before += source_counts[split]
+            progress_callback(split, processed_before, sum(source_counts.values()))
     return records, sources
 
 
@@ -509,26 +726,31 @@ def build_clip_member_index(source: DataSource, clip_id: str) -> dict[str, list[
 
 
 def write_manifest(records: Iterable[Mapping[str, object]], output_path: str | Path) -> Path:
-    """Write records as Parquet, CSV, or JSON based on the output suffix."""
+    """Atomically write records as Parquet, CSV, or JSON."""
 
     output = Path(output_path).expanduser()
     output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_name(f".{output.stem}.{uuid.uuid4().hex}.tmp{output.suffix}")
     rows = list(records)
     suffix = output.suffix.lower()
-    if suffix == ".parquet":
-        try:
-            import pandas as pd
-        except ImportError as exc:
-            raise RuntimeError("Parquet output requires the dashboard dependencies.") from exc
-        pd.DataFrame(rows).to_parquet(output, index=False)
-    elif suffix == ".csv":
-        fields = sorted({field for row in rows for field in row})
-        with output.open("w", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=fields)
-            writer.writeheader()
-            writer.writerows(rows)
-    elif suffix == ".json":
-        output.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
-    else:
-        raise ValueError("Manifest output must end in .parquet, .csv, or .json")
+    try:
+        if suffix == ".parquet":
+            try:
+                import pandas as pd
+            except ImportError as exc:
+                raise RuntimeError("Parquet output requires the dashboard dependencies.") from exc
+            pd.DataFrame(rows).to_parquet(temporary, index=False)
+        elif suffix == ".csv":
+            fields = sorted({field for row in rows for field in row})
+            with temporary.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fields)
+                writer.writeheader()
+                writer.writerows(rows)
+        elif suffix == ".json":
+            temporary.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+        else:
+            raise ValueError("Manifest output must end in .parquet, .csv, or .json")
+        os.replace(temporary, output)
+    finally:
+        temporary.unlink(missing_ok=True)
     return output

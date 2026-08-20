@@ -31,7 +31,11 @@ python -m visualization.build_manifest \
   --dataset-root /path/to/small-model \
   --output artifacts/cuhkx_manifest.parquet
 ```
-The sidebar `Saved manifest` field is pre-filled with `artifacts/cuhkx_manifest.parquet` when it exists, so the common case needs no input. Clear the field or untick `Use saved manifest` to force a live scan (which also re-enables the `Inspect test CSV/JSON quality` checkbox). Generate the manifest once after extracting `HAR/` and `small_model_track_test/`.
+The sidebar `Saved manifest` field is pre-filled with `artifacts/cuhkx_manifest.parquet` when it exists, so the common case needs no input. When it does not exist, progressive loading indexes a representative 200 clips first (100 train and 100 test when both are available), starts the complete manifest build in a separate process, and shows exact file-count progress until it automatically switches to the finished cache. A banner marks the view as partial until that switch occurs, and `Data quality` shows `—` instead of `0` for the payload checks a shallow preview cannot run (`radar_empty`, `imu_empty_files`) and for `depth_skeleton_aligned` when no sampled clip carried both timestamps. Untick `Load 200 clips first` to force the original blocking live scan.
+
+Untick `Use saved manifest` to rebuild a stale manifest. Each untick starts a fresh builder rather than reusing the previous one, and the dashboard switches back to the saved manifest once the rebuild lands. A failed build is kept as-is so that a rerun cannot respawn a doomed builder on every widget interaction; `Clear cached index` drops it and retries.
+
+Progressive loading requires extracted directory sources. ZIP sources fall back to the complete scan because discovering all files for selected clips still requires reading the archive's full central directory. When only one split is extracted — a merged `HAR.zip` alongside an unpacked `small_model_track_test/`, say — the preview covers just that split and the banner names the one still waiting, so `Training clips 0` is not mistaken for a missing dataset.
 
 ### Algorithm comparison
 
@@ -42,7 +46,7 @@ The sidebar `Saved manifest` field is pre-filled with `artifacts/cuhkx_manifest.
 * Confusion matrix (40×40, row-normalized toggle) + Δ recall `A−B` heatmap and per-class F1
 * Cross-validation folds (line per fold + aggregate table) and run metadata (`test_feature_health`, `class_counts`, full JSON)
 
-Add a new algorithm under `modeling/algorithms/` and rerun `python -m modeling.train --algorithm <name>` — it appears with no dashboard code change. Real scores from the reference run: `logistic_regression` (`C=0.01`) → `accuracy 0.4539, macro_f1 0.3896, balanced_accuracy 0.3845` on 2,785 training clips (see `artifacts/logreg/validation.json`). Mount artifacts into Docker:
+Add a new algorithm under `modeling/algorithms/` and rerun `python -m modeling.train --algorithm <name>` — it appears with no dashboard code change. Real scores from the reference run: `logistic_regression` (`C=0.01`) → `accuracy 0.4539, macro_f1 0.3896, balanced_accuracy 0.3845` on 2,785 training clips (see `artifacts/logreg/validation.json`). If the container is used only to read existing validation reports and an existing dataset manifest, the artifacts mount can be read-only:
 
 ```bash
 docker run -d --rm --name cuhkx-dev -p 127.0.0.1:8501:8501 \
@@ -50,6 +54,11 @@ docker run -d --rm --name cuhkx-dev -p 127.0.0.1:8501:8501 \
   -v $(pwd)/artifacts:/app/artifacts:ro \
   cuhkx-visualization
 ```
+
+Remove `:ro` from the artifacts mount when the dashboard should progressively
+build or rebuild `cuhkx_manifest.parquet`, and on Linux add
+`--user "$(id -u):$(id -g)"` so the container's uid 10001 can write to the
+bind-mounted host directory.
 
 ### Clip explorer performance
 
@@ -75,10 +84,17 @@ python3 -m unittest discover -s tests -t .
 
 ```bash
 docker build -t cuhkx-visualization .
+mkdir -p artifacts
 docker run --rm -p 127.0.0.1:8501:8501 \
   -v /path/to/small-model:/data:ro \
+  -v "$(pwd)/artifacts:/app/artifacts" \
   cuhkx-visualization
 ```
 
+On Linux append `--user "$(id -u):$(id -g)"`; the image runs as uid 10001 and a
+bind mount keeps host ownership, so the background builder cannot otherwise
+write into `artifacts`. Docker Desktop on macOS remaps ownership already.
+
 Open <http://localhost:8501>. The container treats `/data` as the dataset
-root and never copies the dataset into the image.
+root and never copies the dataset into the image. The writable `/app/artifacts`
+mount persists the generated manifest and progress state on the host.

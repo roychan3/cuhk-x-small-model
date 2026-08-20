@@ -7,6 +7,8 @@ import io
 import json
 import math
 import re
+import subprocess
+import sys
 from collections import Counter
 from pathlib import Path, PurePosixPath
 
@@ -23,6 +25,7 @@ from visualization.dataset import (
     DataSource,
     build_clip_member_index,
     build_dataset_manifest,
+    build_initial_dataset_manifest,
     build_member_index,
     discover_sources,
     read_members,
@@ -32,6 +35,8 @@ from visualization.playback import normalized_timeline_position, playback_interv
 
 
 st.set_page_config(page_title="CUHK-X Dataset Explorer", page_icon="🧭", layout="wide")
+
+INITIAL_CLIP_LIMIT = 200
 
 SKELETON_EDGES = (
     (0, 1),
@@ -72,13 +77,33 @@ def source_from_dict(data: dict[str, str]) -> DataSource:
 
 
 @st.cache_data(show_spinner=False)
-def cached_live_manifest(dataset_root: str, deep_test: bool) -> tuple[list[dict[str, object]], dict[str, dict[str, str]]]:
+def cached_live_manifest(
+    dataset_root: str,
+    deep_test: bool,
+) -> tuple[list[dict[str, object]], dict[str, dict[str, str]]]:
     records, sources = build_dataset_manifest(dataset_root, deep_test=deep_test)
     return records, {split: source.to_dict() for split, source in sources.items()}
 
 
 @st.cache_data(show_spinner=False)
-def cached_saved_manifest(dataset_root: str, manifest_path: str) -> tuple[list[dict[str, object]], dict[str, dict[str, str]]]:
+def cached_initial_manifest(
+    dataset_root: str,
+    max_clips: int,
+) -> tuple[list[dict[str, object]], dict[str, dict[str, str]]]:
+    records, sources = build_initial_dataset_manifest(dataset_root, max_clips=max_clips)
+    return records, {split: source.to_dict() for split, source in sources.items()}
+
+
+@st.cache_data(show_spinner=False)
+def cached_saved_manifest(
+    dataset_root: str,
+    manifest_path: str,
+    manifest_mtime_ns: int,
+    manifest_size: int,
+) -> tuple[list[dict[str, object]], dict[str, dict[str, str]]]:
+    # mtime and size are cache-key inputs, preventing a background rebuild at
+    # the same path from leaving Streamlit's prior manifest cached indefinitely.
+    del manifest_mtime_ns, manifest_size
     path = Path(manifest_path).expanduser()
     if path.suffix.lower() == ".parquet":
         frame = pd.read_parquet(path)
@@ -101,6 +126,44 @@ def cached_saved_manifest(dataset_root: str, manifest_path: str) -> tuple[list[d
     return frame.where(pd.notna(frame), None).to_dict("records"), {
         split: source.to_dict() for split, source in sources.items()
     }
+
+
+@st.cache_resource(show_spinner=False)
+def background_manifest_process(
+    dataset_root: str,
+    output_path: str,
+    progress_path: str,
+    deep_test: bool,
+) -> subprocess.Popen[str]:
+    """Start one shared full-manifest builder for all Streamlit sessions."""
+
+    command = [
+        sys.executable,
+        "-m",
+        "visualization.build_manifest",
+        "--dataset-root",
+        dataset_root,
+        "--output",
+        output_path,
+        "--progress-file",
+        progress_path,
+    ]
+    if not deep_test:
+        command.append("--no-deep-test")
+    try:
+        Path(progress_path).unlink(missing_ok=True)
+    except OSError:
+        # A read-only artifacts mount cannot be cleared. Let the builder run and
+        # report the failure itself rather than taking the whole page down: this
+        # call sits inside main()'s broad handler, which would st.stop().
+        pass
+    return subprocess.Popen(
+        command,
+        cwd=Path(__file__).resolve().parents[1],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
 
 
 @st.cache_data(show_spinner=False)
@@ -581,15 +644,27 @@ def render_quality(frame: pd.DataFrame) -> None:
     data = frame[frame["split"] == split].copy()
 
     missing = int((data["modality_count"].fillna(0) < len(MODALITIES)).sum())
+    # `radar_empty` and `imu_empty_files` only exist after a deep scan reads the
+    # payloads; `depth_skeleton_aligned` only exists once some clip carried both
+    # timestamps. In either case an absent column means the check never ran, so
+    # show "—" rather than a zero that reads as "measured, and clean".
     radar_values = data.get("radar_empty", pd.Series(False, index=data.index))
     radar_empty = int(radar_values.map(lambda value: str(value).strip().lower() == "true").sum())
     imu_empty = int(pd.to_numeric(data.get("imu_empty_files", pd.Series(0, index=data.index)), errors="coerce").fillna(0).sum())
     alignment = int((data.get("depth_skeleton_aligned", pd.Series(True, index=data.index)) == False).sum())  # noqa: E712
+
+    checked = {"radar_empty", "imu_empty_files", "depth_skeleton_aligned"} & set(data.columns)
+
+    def measured(column: str, value: int) -> str:
+        return f"{value:,}" if column in checked else "—"
+
     columns = st.columns(4)
     columns[0].metric("Incomplete clips", f"{missing:,}")
-    columns[1].metric("Empty radar clips", f"{radar_empty:,}")
-    columns[2].metric("Empty IMU files", f"{imu_empty:,}")
-    columns[3].metric("Depth/Skeleton mismatches", f"{alignment:,}")
+    columns[1].metric("Empty radar clips", measured("radar_empty", radar_empty))
+    columns[2].metric("Empty IMU files", measured("imu_empty_files", imu_empty))
+    columns[3].metric("Depth/Skeleton mismatches", measured("depth_skeleton_aligned", alignment))
+    if len(checked) < 3:
+        st.caption("“—” marks a check that was not run at the current scan depth.")
 
     left, right = st.columns(2)
     with left:
@@ -636,12 +711,93 @@ def render_quality(frame: pd.DataFrame) -> None:
         st.dataframe(issue_rows[display_columns], hide_index=True, width="stretch")
 
 
+def render_background_manifest_status(
+    process: subprocess.Popen[str],
+    output_path: Path,
+    progress_path: Path,
+    visible_clips: int,
+) -> None:
+    """Poll a background manifest process without rerunning the active page."""
+
+    @st.fragment(run_every=1.0)
+    def status_fragment() -> None:
+        return_code = process.poll()
+        if return_code is None:
+            progress: dict[str, object] = {}
+            try:
+                progress = json.loads(progress_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                pass
+
+            phase = str(progress.get("phase", "starting"))
+            processed = int(progress.get("processed", 0) or 0)
+            total = int(progress.get("total", 0) or 0)
+            if phase == "counting":
+                st.progress(
+                    0.0,
+                    text=f"Showing {visible_clips:,} clips · Counting files for the full index…",
+                )
+            elif phase == "writing":
+                st.progress(
+                    0.99,
+                    text=f"Showing {visible_clips:,} clips · Saving the complete index…",
+                )
+            elif total > 0:
+                fraction = min(0.99, max(0.0, processed / total))
+                split_label = phase.capitalize() if phase in {"train", "test"} else "Dataset"
+                st.progress(
+                    fraction,
+                    text=(
+                        f"Showing {visible_clips:,} clips · Indexing {split_label}: "
+                        f"{processed:,}/{total:,} files"
+                    ),
+                )
+            else:
+                st.progress(
+                    0.0,
+                    text=f"Showing {visible_clips:,} clips · Starting the complete index…",
+                )
+            return
+
+        if return_code != 0 or not output_path.is_file():
+            detail = f"builder exited with status {return_code}"
+            if process.stdout is not None and not process.stdout.closed:
+                captured = process.stdout.read().strip()
+                if captured:
+                    detail = captured
+            # The failed process stays cached on purpose: every widget
+            # interaction triggers a full rerun, and dropping it here would
+            # respawn a doomed builder each time. "Clear cached index" is the
+            # explicit retry.
+            st.error(f"The background dataset index failed: {detail}. Use “Clear cached index” to retry.")
+            return
+
+        # Drop the finished process from the resource cache before handing off.
+        # It is keyed only by its arguments, so an exited builder would keep
+        # satisfying later calls: unticking "Use saved manifest" to force a
+        # rebuild would find this same completed process, immediately re-set the
+        # flag below, and silently re-tick the box without rebuilding anything.
+        background_manifest_process.clear()
+        st.session_state["activate_generated_manifest"] = True
+        st.success("Complete dataset index ready. Loading it now…")
+        st.rerun(scope="app")
+
+    status_fragment()
+
+
 def main() -> None:
     st.title("CUHK-X Small Model Dataset Explorer")
     st.caption("Overview, synchronized multimodal samples, and data-quality diagnostics.")
 
     repository_root = Path(__file__).resolve().parents[1]
     generated_manifest = repository_root / "artifacts" / "cuhkx_manifest.parquet"
+    generated_progress = repository_root / "artifacts" / "cuhkx_manifest.progress.json"
+
+    # A fragment sets this flag when its background builder finishes. Apply
+    # widget state before those widgets are instantiated on the next full run.
+    if st.session_state.pop("activate_generated_manifest", False):
+        st.session_state["saved_manifest_input"] = str(generated_manifest)
+        st.session_state["use_manifest_checkbox"] = True
 
     # Page selector is rendered first so "Algorithm comparison" never triggers
     # dataset I/O or the "Loading dataset manifest…" spinner.
@@ -654,7 +810,10 @@ def main() -> None:
                 st.cache_data.clear()
                 st.rerun()
         else:
-            st.caption("Other pages scan the dataset. A pre-built `artifacts/cuhkx_manifest.parquet` makes them instant.")
+            st.caption(
+                "A saved manifest loads instantly; otherwise the first 200 clips "
+                "are shown while the full index builds."
+            )
 
     if page == "Algorithm comparison":
         render_algorithm_comparison()
@@ -663,24 +822,42 @@ def main() -> None:
     # Only for the three dataset-dependent pages
     default_root = str(resolve_dataset_root())
     default_manifest = str(generated_manifest) if generated_manifest.is_file() else ""
+    if "saved_manifest_input" not in st.session_state:
+        st.session_state["saved_manifest_input"] = default_manifest
+    if "use_manifest_checkbox" not in st.session_state:
+        st.session_state["use_manifest_checkbox"] = True
     with st.sidebar:
         dataset_root = st.text_input("Dataset root", default_root, key="dataset_root_input")
-        # Pre-filled with the generated parquet when it exists, so the common
-        # case needs no input. Clearing the field (or unchecking below) forces a
-        # live scan — otherwise `deep_test` would be permanently disabled with
-        # no way to re-enable it.
-        saved_manifest = st.text_input("Saved manifest (optional)", default_manifest, key="saved_manifest_input").strip()
+        # Pre-filled with the generated parquet when it exists. Clearing the
+        # field or unchecking below enables progressive/background rebuilding.
+        saved_manifest = st.text_input(
+            "Saved manifest (optional)", key="saved_manifest_input"
+        ).strip()
         use_manifest = st.checkbox(
             "Use saved manifest",
-            value=True,
             disabled=not saved_manifest,
-            help="Uncheck to force a live dataset scan and re-enable the quality checks below.",
+            help="Uncheck to rebuild from the dataset using progressive or blocking loading below.",
             key="use_manifest_checkbox",
         )
         effective_manifest = saved_manifest if use_manifest else ""
-        deep_test = st.checkbox("Inspect test CSV/JSON quality", value=True, disabled=bool(effective_manifest), key="deep_test_checkbox")
+        progressive = st.checkbox(
+            f"Load {INITIAL_CLIP_LIMIT} clips first",
+            value=True,
+            disabled=bool(effective_manifest),
+            help="Show a representative subset immediately while a complete manifest is built in the background.",
+            key="progressive_loading_checkbox",
+        )
+        deep_test = st.checkbox(
+            "Inspect test CSV/JSON quality",
+            value=True,
+            disabled=bool(effective_manifest),
+            key="deep_test_checkbox",
+        )
         if st.button("Clear cached index", key="clear_cache_main"):
             st.cache_data.clear()
+            # Also drops a finished or failed background builder, so this is the
+            # retry path when the complete index could not be written.
+            st.cache_resource.clear()
             st.rerun()
 
     root = Path(dataset_root).expanduser()
@@ -688,10 +865,25 @@ def main() -> None:
         st.error(f"Dataset root does not exist: {root}")
         st.stop()
 
+    background_process: subprocess.Popen[str] | None = None
+    partial_manifest = False
     try:
         with st.spinner("Loading dataset manifest…"):
             if effective_manifest:
-                records, sources = cached_saved_manifest(str(root), effective_manifest)
+                manifest = Path(effective_manifest).expanduser()
+                stat = manifest.stat()
+                records, sources = cached_saved_manifest(
+                    str(root), effective_manifest, stat.st_mtime_ns, stat.st_size
+                )
+            elif progressive:
+                records, sources = cached_initial_manifest(str(root), INITIAL_CLIP_LIMIT)
+                if records:
+                    partial_manifest = True
+                    background_process = background_manifest_process(
+                        str(root), str(generated_manifest), str(generated_progress), deep_test
+                    )
+                else:
+                    records, sources = cached_live_manifest(str(root), deep_test)
             else:
                 records, sources = cached_live_manifest(str(root), deep_test)
     except Exception as exc:
@@ -703,6 +895,30 @@ def main() -> None:
         st.stop()
 
     frame = pd.DataFrame(records)
+    if partial_manifest and background_process is not None:
+        render_background_manifest_status(
+            background_process,
+            generated_manifest,
+            generated_progress,
+            len(records),
+        )
+        # Only extracted directory sources can be sampled without a full scan,
+        # so a split still held in an archive contributes nothing to the preview.
+        # Name it explicitly — otherwise "Training clips 0" reads as a missing
+        # dataset rather than a split that has not been indexed yet.
+        previewed_splits = {str(record["split"]) for record in records}
+        pending_splits = sorted(split for split in sources if split not in previewed_splits)
+        message = (
+            "This is a representative partial dataset. Overview and Data quality "
+            "totals will update when the complete index is ready."
+        )
+        if pending_splits:
+            noun = "split is" if len(pending_splits) == 1 else "splits are"
+            message += (
+                f" The {', '.join(pending_splits)} {noun} absent from this preview because"
+                " the source is an archive; it appears when the complete index is ready."
+            )
+        st.warning(message)
     with st.sidebar:
         for split, source_data in sources.items():
             source = source_from_dict(source_data)

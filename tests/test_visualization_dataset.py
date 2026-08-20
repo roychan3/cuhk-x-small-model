@@ -14,10 +14,14 @@ from visualization.dataset import (
     DataSource,
     Member,
     build_clip_member_index,
+    build_dataset_manifest,
+    build_initial_dataset_manifest,
     build_member_index,
     build_source_manifest,
+    initial_clip_ids,
     parse_member,
     resolve_dataset_root,
+    write_manifest,
 )
 from visualization.playback import normalized_timeline_position, playback_interval, timeline_frame_count
 
@@ -119,6 +123,121 @@ class ClipMemberIndexTests(unittest.TestCase):
             root.mkdir(parents=True)
             source = DataSource("test", "directory", str(root))
             self.assertEqual(build_clip_member_index(source, "SM_test_9999"), {})
+
+
+class ProgressiveManifestTests(unittest.TestCase):
+    def test_initial_training_clips_are_spread_across_actions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "HAR"
+            for action in ("0_Wash_face", "1_Brush_teeth"):
+                for trial in ("1-1-1", "1-1-2", "1-1-3"):
+                    clip = root / "data" / "Depth_Color" / action / "user1" / trial
+                    clip.mkdir(parents=True)
+                    (clip / "frame.png").write_bytes(b"png")
+            source = DataSource("train", "directory", str(root))
+            selected = initial_clip_ids(source, 2)
+            self.assertEqual(len(selected), 2)
+            self.assertEqual(
+                {clip.split("/", 1)[0] for clip in selected},
+                {"0_Wash_face", "1_Brush_teeth"},
+            )
+
+    def test_initial_manifest_skips_archive_splits_but_still_reports_them(self) -> None:
+        """An archived split contributes no preview clips yet stays discoverable.
+
+        The dashboard names such a split in its partial-data banner, so
+        ``sources`` must keep it even though ``records`` cannot cover it.
+        """
+
+        with tempfile.TemporaryDirectory() as tmp:
+            dataset_root = Path(tmp)
+            train_data = dataset_root / "Training" / "data"
+            train_data.mkdir(parents=True)
+            with zipfile.ZipFile(train_data / "HAR_full.zip", "w") as archive:
+                archive.writestr("HAR/data/Depth_Color/0_Action/user1/1-1-1/frame.png", b"png")
+            test_clip = (
+                dataset_root / "Testing" / "data" / "small_model_track_test" / "SM_test_0001" / "Depth_Color"
+            )
+            test_clip.mkdir(parents=True)
+            (test_clip / "frame.png").write_bytes(b"png")
+
+            records, sources = build_initial_dataset_manifest(dataset_root, max_clips=4)
+            self.assertEqual(sources["train"].kind, "zip")
+            self.assertEqual({record["split"] for record in records}, {"test"})
+            self.assertEqual(sorted(sources), ["test", "train"])
+
+    def test_initial_manifest_splits_budget_between_train_and_test(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            dataset_root = Path(tmp)
+            train_root = dataset_root / "Training" / "data" / "HAR"
+            test_root = dataset_root / "Testing" / "data" / "small_model_track_test"
+            for index in range(4):
+                train_clip = (
+                    train_root
+                    / "data"
+                    / "Depth_Color"
+                    / f"{index}_Action"
+                    / "user1"
+                    / "1-1-1"
+                )
+                train_clip.mkdir(parents=True)
+                (train_clip / "frame.png").write_bytes(b"png")
+                test_clip = test_root / f"SM_test_{index:04d}" / "Depth_Color"
+                test_clip.mkdir(parents=True)
+                (test_clip / "frame.png").write_bytes(b"png")
+
+            records, sources = build_initial_dataset_manifest(dataset_root, max_clips=5)
+            split_counts = {split: sum(record["split"] == split for record in records) for split in sources}
+            self.assertEqual(len(records), 5)
+            self.assertEqual(split_counts, {"train": 3, "test": 2})
+
+    def test_manifest_write_replaces_target_without_leaving_temporary_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "manifest.json"
+            output.write_text("old", encoding="utf-8")
+            write_manifest([{"clip_id": "new"}], output)
+            self.assertEqual(json.loads(output.read_text(encoding="utf-8")), [{"clip_id": "new"}])
+            self.assertEqual(list(output.parent.glob(".*.tmp.json")), [])
+
+    def test_full_manifest_reports_exact_file_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            dataset_root = Path(tmp)
+            train_clip = (
+                dataset_root
+                / "Training"
+                / "data"
+                / "HAR"
+                / "data"
+                / "Depth_Color"
+                / "0_Action"
+                / "user1"
+                / "1-1-1"
+            )
+            train_clip.mkdir(parents=True)
+            (train_clip / "frame.png").write_bytes(b"png")
+            test_clip = (
+                dataset_root
+                / "Testing"
+                / "data"
+                / "small_model_track_test"
+                / "SM_test_0001"
+                / "IR"
+            )
+            test_clip.mkdir(parents=True)
+            (test_clip / "frame.png").write_bytes(b"png")
+
+            updates: list[tuple[str, int, int]] = []
+            records, _ = build_dataset_manifest(
+                dataset_root,
+                deep_test=False,
+                progress_callback=lambda phase, processed, total: updates.append(
+                    (phase, processed, total)
+                ),
+            )
+
+            self.assertEqual(len(records), 2)
+            self.assertEqual(updates[0], ("counting", 0, 0))
+            self.assertEqual(updates[-1], ("test", 2, 2))
 
 
 class DatasetRootResolutionTests(unittest.TestCase):
