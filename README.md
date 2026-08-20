@@ -124,7 +124,8 @@ This repository includes a Streamlit dashboard with:
 - synchronized Depth Color, IR, and Thermal frames with play, pause, restart,
   speed, and manual scrubbing controls;
 - animated 3D skeletons, IMU magnitude traces, and radar point clouds;
-- missing-modality, empty-sensor, and timestamp-alignment diagnostics.
+- missing-modality, empty-sensor, and timestamp-alignment diagnostics;
+- **Algorithm comparison** page comparing every `artifacts/*/validation.json` (leaderboard, bar chart, confusion matrix + Δ recall, folds, metadata) — same source as `python -m modeling.compare`, and its CSV download is byte-identical to that command's output.
 
 Set up the dashboard:
 
@@ -152,7 +153,7 @@ Change the default for everyone by editing `DEFAULT_DATASET_ROOT` in
 ### Build a reusable manifest
 
 The manifest contains one row per logical clip and avoids rescanning the
-archives on every launch:
+archives on every launch (strongly recommended — `Overview`/`Clip explorer`/`Data quality` then load in ~0.2 s via `artifacts/cuhkx_manifest.parquet` auto-detected by the dashboard, instead of live-scanning 3k+ clips and running `deep_test` JSON checks):
 
 ```bash
 python -m visualization.build_manifest \
@@ -160,8 +161,7 @@ python -m visualization.build_manifest \
   --output artifacts/cuhkx_manifest.parquet
 ```
 
-Enter the generated manifest path in the dashboard sidebar. CSV and JSON are
-also supported; use an output filename ending in `.csv` or `.json`.
+The dashboard pre-fills the sidebar with `artifacts/cuhkx_manifest.parquet` when it exists; clear the field or untick `Use saved manifest` to force a live scan. The `Algorithm comparison` page does not need the dataset at all — it reads only `artifacts/*/validation.json`. `Clip explorer` now indexes only the selected clip (~0.02 s) instead of all 3k+ clips (19.5 s train / 2.1 s test). CSV and JSON manifests are also supported (use `.csv` / `.json` suffix).
 
 ### Multipart training archive
 
@@ -180,17 +180,18 @@ symlinks.
 ### Docker
 
 The Docker image contains the visualization module only. Mount the dataset
-read-only at `/data` so it is not copied into the image:
+read-only at `/data` so it is not copied into the image. For the `Algorithm comparison` page mount `artifacts` as well so it sees real scores (`artifacts/logreg/validation.json` etc.):
 
 ```bash
 docker build -t cuhkx-visualization .
 docker run --rm -p 127.0.0.1:8501:8501 \
   -v /path/to/small-model:/data:ro \
+  -v $(pwd)/artifacts:/app/artifacts:ro \
   cuhkx-visualization
 ```
 
 Then open <http://localhost:8501>. See `visualization/README.md` for the
-module-specific commands and layout.
+module-specific commands and layout. Real scores from the reference run: `logistic_regression` `C=0.01` → `accuracy 0.4539, macro_f1 0.3896` on 2,785 clips.
 
 ## Logistic-regression baseline
 
@@ -224,20 +225,23 @@ Run it from the repository root:
 python3 -m unittest discover -s tests -t .
 ```
 
-There are two suites with different requirements:
+There are four suites with different requirements:
 
-| Suite | Requires | Behavior without the requirement |
-|-------|----------|----------------------------------|
-| `tests/test_visualization_dataset.py` | standard library only | always runs |
-| `tests/test_modeling.py` | `modeling/requirements.txt` | skipped, reported as `OK (skipped=1)` |
+| Suite | Tests | Requires | Behavior without the requirement |
+|-------|-------|----------|----------------------------------|
+| `tests/test_visualization_dataset.py` | 10 | standard library only | always runs |
+| `tests/test_comparison_format.py` | 13 | standard library only | always runs; its 2 CLI-parity tests skip without `modeling/requirements.txt` |
+| `tests/test_algorithm_comparison.py` | 16 | `visualization/requirements.txt` + `numpy` (for confusion-matrix math) | collapses to 1 skip |
+| `tests/test_modeling.py` | 11 | `modeling/requirements.txt` | collapses to 1 skip |
 
-So a bare interpreter reports `Ran 8 tests ... OK (skipped=1)`, while an
-interpreter with NumPy, Pillow, and scikit-learn reports `Ran 14 tests ... OK`.
-A skip is expected, not a failure. Install the modeling extras to run
+So a bare interpreter reports `Ran 25 tests ... OK (skipped=4)`, while an
+interpreter with `visualization` + `modeling` deps reports `Ran 50 tests ... OK`.
+A skip is expected, not a failure. Install the extras to run
 everything:
 
 ```bash
-pip install -r modeling/requirements.txt
+pip install -r visualization/requirements.txt   # for algorithm comparison tests
+pip install -r modeling/requirements.txt        # for modeling tests
 python3 -m unittest discover -s tests -t .
 ```
 

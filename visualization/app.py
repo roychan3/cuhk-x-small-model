@@ -16,10 +16,12 @@ import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 
+from visualization.algorithm_comparison import render_algorithm_comparison
 from visualization.dataset import (
     MODALITIES,
     MODALITY_SLUGS,
     DataSource,
+    build_clip_member_index,
     build_dataset_manifest,
     build_member_index,
     discover_sources,
@@ -104,6 +106,11 @@ def cached_saved_manifest(dataset_root: str, manifest_path: str) -> tuple[list[d
 @st.cache_data(show_spinner=False)
 def cached_member_index(source_data: dict[str, str]) -> dict[str, dict[str, list[str]]]:
     return build_member_index(source_from_dict(source_data))
+
+
+@st.cache_data(show_spinner=False)
+def cached_clip_index(source_data: dict[str, str], clip_id: str) -> dict[str, list[str]]:
+    return build_clip_member_index(source_from_dict(source_data), clip_id)
 
 
 @st.cache_data(show_spinner=False, max_entries=128)
@@ -485,9 +492,8 @@ def render_clip_explorer(frame: pd.DataFrame, sources: dict[str, dict[str, str]]
         )
         return
 
-    with st.spinner("Indexing media members…"):
-        index = cached_member_index(source_data)
-    modalities = index.get(clip_id, {})
+    with st.spinner("Indexing clip…"):
+        modalities = cached_clip_index(source_data, clip_id)
     imu_paths = modalities.get("IMU", [])
     radar_paths = modalities.get("Radar", [])
     static_paths = tuple(dict.fromkeys([*imu_paths, *radar_paths]))
@@ -634,19 +640,48 @@ def main() -> None:
     st.title("CUHK-X Small Model Dataset Explorer")
     st.caption("Overview, synchronized multimodal samples, and data-quality diagnostics.")
 
-    default_root = str(resolve_dataset_root())
     repository_root = Path(__file__).resolve().parents[1]
     generated_manifest = repository_root / "artifacts" / "cuhkx_manifest.parquet"
-    default_manifest = str(generated_manifest) if generated_manifest.is_file() else ""
+
+    # Page selector is rendered first so "Algorithm comparison" never triggers
+    # dataset I/O or the "Loading dataset manifest…" spinner.
     with st.sidebar:
         st.header("Data source")
-        dataset_root = st.text_input("Dataset root", default_root)
-        saved_manifest = st.text_input("Saved manifest (optional)", default_manifest)
-        deep_test = st.checkbox("Inspect test CSV/JSON quality", value=True, disabled=bool(saved_manifest))
-        if st.button("Clear cached index"):
+        page = st.radio("Page", ("Overview", "Clip explorer", "Data quality", "Algorithm comparison"))
+        if page == "Algorithm comparison":
+            st.caption("No dataset scan needed — reads `artifacts/*/validation.json`.")
+            if st.button("Clear cached index"):
+                st.cache_data.clear()
+                st.rerun()
+        else:
+            st.caption("Other pages scan the dataset. A pre-built `artifacts/cuhkx_manifest.parquet` makes them instant.")
+
+    if page == "Algorithm comparison":
+        render_algorithm_comparison()
+        return
+
+    # Only for the three dataset-dependent pages
+    default_root = str(resolve_dataset_root())
+    default_manifest = str(generated_manifest) if generated_manifest.is_file() else ""
+    with st.sidebar:
+        dataset_root = st.text_input("Dataset root", default_root, key="dataset_root_input")
+        # Pre-filled with the generated parquet when it exists, so the common
+        # case needs no input. Clearing the field (or unchecking below) forces a
+        # live scan — otherwise `deep_test` would be permanently disabled with
+        # no way to re-enable it.
+        saved_manifest = st.text_input("Saved manifest (optional)", default_manifest, key="saved_manifest_input").strip()
+        use_manifest = st.checkbox(
+            "Use saved manifest",
+            value=True,
+            disabled=not saved_manifest,
+            help="Uncheck to force a live dataset scan and re-enable the quality checks below.",
+            key="use_manifest_checkbox",
+        )
+        effective_manifest = saved_manifest if use_manifest else ""
+        deep_test = st.checkbox("Inspect test CSV/JSON quality", value=True, disabled=bool(effective_manifest), key="deep_test_checkbox")
+        if st.button("Clear cached index", key="clear_cache_main"):
             st.cache_data.clear()
             st.rerun()
-        page = st.radio("Page", ("Overview", "Clip explorer", "Data quality"))
 
     root = Path(dataset_root).expanduser()
     if not root.is_dir():
@@ -655,8 +690,8 @@ def main() -> None:
 
     try:
         with st.spinner("Loading dataset manifest…"):
-            if saved_manifest:
-                records, sources = cached_saved_manifest(str(root), saved_manifest)
+            if effective_manifest:
+                records, sources = cached_saved_manifest(str(root), effective_manifest)
             else:
                 records, sources = cached_live_manifest(str(root), deep_test)
     except Exception as exc:

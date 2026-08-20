@@ -140,8 +140,20 @@ feature cache, grouped folds, metrics, artifact format, and submission logic.
 Compare completed runs with:
 
 ```bash
-python -m modeling.compare
+python -m modeling.compare                        # tab-separated to stdout
+python -m modeling.compare --output comparison.csv
 ```
+
+Columns: `label`, `algorithm`, `artifact_name`, `parameters`, `accuracy`,
+`macro_f1`, `balanced_accuracy`, `training_clips`, `report`, sorted by
+`macro_f1` descending. `algorithm` alone is not a key — two artifact
+directories can hold runs of the same algorithm — so `label` disambiguates
+them as `logistic_regression (logreg_tuned)` while leaving unique names bare.
+
+The format is defined once in `visualization/comparison_format.py` (standard
+library only, so this CLI gains no visualization dependencies) and shared with
+the dashboard's `Algorithm comparison` page, which writes a byte-identical CSV
+from its download button.
 
 All scaling, imputation, and PCA fitting happens inside each validation fold.
 The validation groups are participants, preventing clips from one person from
