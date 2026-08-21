@@ -216,7 +216,9 @@ generation or rebuild the manifest; the dashboard reports the failed build
 instead of stopping.
 
 Then open <http://localhost:8501>. See `visualization/README.md` for the
-module-specific commands and layout. Real scores from the reference run: `logistic_regression` `C=0.01` → `accuracy 0.4539, macro_f1 0.3896` on 2,785 clips.
+module-specific commands and layout. Real scores from the expanded-feature
+reference run: `logistic_regression` `C=0.1` → `accuracy 0.5382, macro_f1
+0.4765` on 2,785 clips.
 
 ## Logistic-regression baseline
 
@@ -258,10 +260,10 @@ There are five suites with different requirements:
 | `tests/test_predictions.py` | 7 | standard library only | always runs |
 | `tests/test_comparison_format.py` | 13 | standard library only | always runs; its 2 CLI-parity tests skip without `modeling/requirements.txt` |
 | `tests/test_algorithm_comparison.py` | 16 | `visualization/requirements.txt` + `numpy` (for confusion-matrix math) | collapses to 1 skip |
-| `tests/test_modeling.py` | 11 | `modeling/requirements.txt` | collapses to 1 skip |
+| `tests/test_modeling.py` | 14 | `modeling/requirements.txt` | collapses to 1 skip |
 
 So a bare interpreter reports `Ran 37 tests ... OK (skipped=4)`, while an
-interpreter with `visualization` + `modeling` deps reports `Ran 62 tests ... OK`
+interpreter with `visualization` + `modeling` deps reports `Ran 65 tests ... OK`
 (`skipped=1` when the optional real validation artifact is absent). A skip is
 expected, not a failure. Install the extras to run
 everything:

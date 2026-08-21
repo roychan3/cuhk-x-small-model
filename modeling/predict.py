@@ -71,7 +71,10 @@ def main() -> int:
         / "outputs"
         / f"{_artifact_name(model.algorithm_name)}_submission.csv"
     )
-    config = FeatureConfig(**model.feature_config)
+    config_values = dict(model.feature_config)
+    if "include_legacy_ir" not in config_values:
+        config_values["include_legacy_ir"] = "ir" in model.reducers
+    config = FeatureConfig(**config_values)
     records = discover_test_clips(resolve_dataset_root(args.dataset_root), args.test_csv)
     bundle = extract_feature_bundle(records, config, n_jobs=args.n_jobs)
     predictions = model.predict(bundle)

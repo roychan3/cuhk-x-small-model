@@ -52,9 +52,13 @@ class FittedMultimodalModel:
     library_versions: dict[str, str] = field(default_factory=dict)
 
     def transform(self, bundle: RawFeatureBundle) -> np.ndarray:
+        arrays = bundle.modality_arrays()
+        missing = set(self.reducers) - set(arrays)
+        if missing:
+            raise ValueError(f"Feature bundle is missing model blocks: {sorted(missing)}")
         blocks = [
-            self.reducers[name].transform(bundle.modality_arrays()[name])
-            for name in ("depth", "ir", "imu", "skeleton")
+            reducer.transform(arrays[name])
+            for name, reducer in self.reducers.items()
         ]
         return self.combined_scaler.transform(np.concatenate(blocks, axis=1))
 
@@ -68,20 +72,23 @@ class FittedMultimodalModel:
 
 
 def _make_reducer(name: str, random_state: int) -> Pipeline:
-    return Pipeline(
-        (
-            ("imputer", SimpleImputer(strategy="mean", keep_empty_features=True)),
-            ("scaler", StandardScaler()),
+    steps: list[tuple[str, Any]] = [
+        ("imputer", SimpleImputer(strategy="mean", keep_empty_features=True)),
+        ("scaler", StandardScaler()),
+    ]
+    components = PCA_COMPONENTS.get(name)
+    if components is not None:
+        steps.append(
             (
                 "pca",
                 PCA(
-                    n_components=PCA_COMPONENTS[name],
+                    n_components=components,
                     svd_solver="randomized",
                     random_state=random_state,
                 ),
-            ),
+            )
         )
-    )
+    return Pipeline(steps)
 
 
 def _fit_reducers(
@@ -90,7 +97,7 @@ def _fit_reducers(
     random_state: int,
 ) -> dict[str, Pipeline]:
     reducers: dict[str, Pipeline] = {}
-    for name in ("depth", "ir", "imu", "skeleton"):
+    for name in arrays:
         reducer = _make_reducer(name, random_state)
         reducer.fit(arrays[name][train_indices])
         reducers[name] = reducer
@@ -103,7 +110,7 @@ def _transform(
     indices: np.ndarray,
 ) -> np.ndarray:
     return np.concatenate(
-        [reducers[name].transform(arrays[name][indices]) for name in ("depth", "ir", "imu", "skeleton")],
+        [reducer.transform(arrays[name][indices]) for name, reducer in reducers.items()],
         axis=1,
     )
 

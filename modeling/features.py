@@ -20,6 +20,9 @@ from modeling.data import ClipRecord, EXPECTED_IMU_DEVICES
 
 _TIMESTAMP_RE = re.compile(r"(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.\d{3})")
 _FRAME_RE = re.compile(r"(?:frame_|_)(\d+)(?:_Color)?\.(?:jpg|jpeg|png|json)$", re.I)
+_IMU_BASE_CHANNELS = 8
+_IMU_EXTENDED_CHANNELS = 18
+_DYNAMIC_FEATURES = 9
 
 
 @dataclass(frozen=True)
@@ -27,8 +30,11 @@ class FeatureConfig:
     image_width: int = 64
     image_height: int = 48
     max_image_frames: int = 64
+    image_engineered_grid: tuple[int, int] = (4, 4)
+    include_legacy_ir: bool = False
     skeleton_frames: int = 32
     temporal_bins: int = 4
+    spectral_samples: int = 64
     hog_orientations: int = 9
     hog_pixels_per_cell: tuple[int, int] = (8, 8)
     hog_cells_per_block: tuple[int, int] = (2, 2)
@@ -38,20 +44,35 @@ class FeatureConfig:
 class RawFeatureBundle:
     clip_ids: np.ndarray
     depth: np.ndarray
-    ir: np.ndarray
+    ir: np.ndarray | None
     imu: np.ndarray
     skeleton: np.ndarray
+    depth_engineered: np.ndarray | None = None
+    ir_engineered: np.ndarray | None = None
+    imu_engineered: np.ndarray | None = None
+    skeleton_engineered: np.ndarray | None = None
     labels: np.ndarray | None = None
     groups: np.ndarray | None = None
     submission_paths: np.ndarray | None = None
 
     def modality_arrays(self) -> dict[str, np.ndarray]:
-        return {
+        arrays: dict[str, np.ndarray | None] = {
             "depth": self.depth,
             "ir": self.ir,
             "imu": self.imu,
             "skeleton": self.skeleton,
+            "depth_engineered": self.depth_engineered,
+            "ir_engineered": self.ir_engineered,
+            "imu_engineered": self.imu_engineered,
+            "skeleton_engineered": self.skeleton_engineered,
         }
+        return {name: values for name, values in arrays.items() if values is not None}
+
+
+@dataclass(frozen=True)
+class _IMUDeviceSeries:
+    timestamps: np.ndarray
+    values: np.ndarray
 
 
 def _path_sort_key(path: Path) -> tuple[str, int, str]:
@@ -71,7 +92,12 @@ def _evenly_sample(paths: Sequence[Path], maximum: int) -> list[Path]:
     return [paths[index] for index in indices]
 
 
-def _load_image_frames(directory: Path, config: FeatureConfig) -> np.ndarray | None:
+def _load_image_frame_data(
+    directory: Path,
+    config: FeatureConfig,
+    *,
+    include_color: bool,
+) -> tuple[np.ndarray, np.ndarray | None] | None:
     paths = sorted(
         (
             path
@@ -82,17 +108,29 @@ def _load_image_frames(directory: Path, config: FeatureConfig) -> np.ndarray | N
     )
     paths = _evenly_sample(paths, config.max_image_frames)
     frames: list[np.ndarray] = []
+    color_frames: list[np.ndarray] = []
     for path in paths:
         try:
             with Image.open(path) as image:
-                image = image.convert("L").resize(
+                grayscale = image.convert("L").resize(
                     (config.image_width, config.image_height),
                     Image.Resampling.BILINEAR,
                 )
-                frames.append(np.asarray(image, dtype=np.float32) / 255.0)
+                grayscale_array = np.asarray(grayscale, dtype=np.float32) / 255.0
+                if include_color:
+                    hsv = image.convert("HSV").resize(
+                        (config.image_width, config.image_height),
+                        Image.Resampling.BILINEAR,
+                    )
+                    color_array = np.asarray(hsv, dtype=np.float32) / 255.0
+                frames.append(grayscale_array)
+                if include_color:
+                    color_frames.append(color_array)
         except (OSError, ValueError):
             continue
-    return np.stack(frames) if frames else None
+    if not frames:
+        return None
+    return np.stack(frames), np.stack(color_frames) if include_color else None
 
 
 def _image_summaries(frames: np.ndarray) -> np.ndarray:
@@ -116,6 +154,14 @@ def _coarse_pool(image: np.ndarray) -> np.ndarray:
     if height % 12 != 0 or width % 16 != 0:
         raise ValueError("Image dimensions must be divisible into a 12x16 coarse grid")
     return image.reshape(12, height // 12, 16, width // 16).mean(axis=(1, 3))
+
+
+def _grid_pool(image: np.ndarray, grid: tuple[int, int]) -> np.ndarray:
+    rows, columns = grid
+    height, width = image.shape
+    if height % rows != 0 or width % columns != 0:
+        raise ValueError(f"Image dimensions must be divisible into a {rows}x{columns} grid")
+    return image.reshape(rows, height // rows, columns, width // columns).mean(axis=(1, 3))
 
 
 def _hog(image: np.ndarray, config: FeatureConfig) -> np.ndarray:
@@ -183,18 +229,133 @@ def image_feature_size(config: FeatureConfig) -> int:
     return 5 * (hog_size + 12 * 16 + 5)
 
 
-def extract_image_features(directory: Path, config: FeatureConfig) -> np.ndarray:
-    frames = _load_image_frames(directory, config)
-    if frames is None:
-        return np.full(image_feature_size(config), np.nan, dtype=np.float32)
+def image_engineered_feature_size(config: FeatureConfig, *, include_color: bool) -> int:
+    grid_size = config.image_engineered_grid[0] * config.image_engineered_grid[1]
+    grayscale_size = config.temporal_bins * (3 * grid_size + 9)
+    color_size = config.temporal_bins * 3 * grid_size + 3 * 12 if include_color else 0
+    return grayscale_size + color_size
 
+
+def _motion_center(motion: np.ndarray) -> tuple[float, float]:
+    weights = np.asarray(motion, dtype=np.float64)
+    total = float(np.sum(weights))
+    if total <= 1e-12:
+        return 0.5, 0.5
+    rows = np.linspace(0.0, 1.0, weights.shape[0])[:, None]
+    columns = np.linspace(0.0, 1.0, weights.shape[1])[None, :]
+    return float(np.sum(weights * columns) / total), float(np.sum(weights * rows) / total)
+
+
+def _ensure_temporal_length(values: np.ndarray, minimum: int) -> np.ndarray:
+    if len(values) >= minimum:
+        return values
+    indices = np.linspace(0, len(values) - 1, minimum).round().astype(int)
+    return values[indices]
+
+
+def _image_engineered_features(
+    frames: np.ndarray,
+    color_frames: np.ndarray | None,
+    config: FeatureConfig,
+) -> np.ndarray:
+    grid = config.image_engineered_grid
+    temporal_frames = _ensure_temporal_length(frames, config.temporal_bins)
     features: list[np.ndarray] = []
-    for summary in _image_summaries(frames):
-        hog_features = _hog(summary, config)
-        coarse = _coarse_pool(summary).ravel().astype(np.float32)
-        percentiles = np.percentile(summary, (0, 25, 50, 75, 100)).astype(np.float32)
-        features.extend((hog_features, coarse, percentiles))
+    for chunk in np.array_split(temporal_frames, config.temporal_bins):
+        mean_image = np.mean(chunk, axis=0)
+        signed_motion = chunk[-1] - chunk[0]
+        absolute_motion = (
+            np.mean(np.abs(np.diff(chunk, axis=0)), axis=0)
+            if len(chunk) > 1
+            else np.zeros_like(chunk[0])
+        )
+        center_x, center_y = _motion_center(absolute_motion)
+        scalar = np.asarray(
+            (
+                np.mean(chunk),
+                np.std(chunk),
+                np.percentile(chunk, 25),
+                np.median(chunk),
+                np.percentile(chunk, 75),
+                np.mean(absolute_motion),
+                np.std(absolute_motion),
+                center_x,
+                center_y,
+            ),
+            dtype=np.float32,
+        )
+        features.extend(
+            (
+                _grid_pool(mean_image, grid).ravel().astype(np.float32),
+                _grid_pool(absolute_motion, grid).ravel().astype(np.float32),
+                _grid_pool(signed_motion, grid).ravel().astype(np.float32),
+                scalar,
+            )
+        )
+
+    if color_frames is not None:
+        temporal_color = _ensure_temporal_length(color_frames, config.temporal_bins)
+        for chunk in np.array_split(temporal_color, config.temporal_bins):
+            mean_color = np.mean(chunk, axis=0)
+            for channel in range(3):
+                features.append(
+                    _grid_pool(mean_color[:, :, channel], grid).ravel().astype(np.float32)
+                )
+        for channel in range(3):
+            histogram, _ = np.histogram(
+                color_frames[:, :, :, channel],
+                bins=12,
+                range=(0.0, 1.0),
+            )
+            total = max(1, int(np.sum(histogram)))
+            features.append((histogram / total).astype(np.float32))
     return np.concatenate(features).astype(np.float32)
+
+
+def extract_image_feature_pair(
+    directory: Path,
+    config: FeatureConfig,
+    *,
+    include_color: bool,
+    include_base: bool = True,
+) -> tuple[np.ndarray | None, np.ndarray]:
+    loaded = _load_image_frame_data(directory, config, include_color=include_color)
+    if loaded is None:
+        return (
+            (
+                np.full(image_feature_size(config), np.nan, dtype=np.float32)
+                if include_base
+                else None
+            ),
+            np.full(
+                image_engineered_feature_size(config, include_color=include_color),
+                np.nan,
+                dtype=np.float32,
+            ),
+        )
+    frames, color_frames = loaded
+    base: np.ndarray | None = None
+    if include_base:
+        summaries: list[np.ndarray] = []
+        for summary in _image_summaries(frames):
+            summaries.extend(
+                (
+                    _hog(summary, config),
+                    _coarse_pool(summary).ravel().astype(np.float32),
+                    np.percentile(summary, (0, 25, 50, 75, 100)).astype(np.float32),
+                )
+            )
+        base = np.concatenate(summaries).astype(np.float32)
+    return (
+        base,
+        _image_engineered_features(frames, color_frames, config),
+    )
+
+
+def extract_image_features(directory: Path, config: FeatureConfig) -> np.ndarray:
+    base, _ = extract_image_feature_pair(directory, config, include_color=False)
+    assert base is not None
+    return base
 
 
 def _parse_time(value: str, fallback: int) -> float:
@@ -213,7 +374,7 @@ def _safe_float(value: str) -> float | None:
     return number if math.isfinite(number) else None
 
 
-def _read_imu(directory: Path) -> dict[str, np.ndarray]:
+def _read_imu(directory: Path) -> dict[str, _IMUDeviceSeries]:
     rows_by_device: dict[str, list[tuple[float, np.ndarray]]] = {
         device: [] for device in EXPECTED_IMU_DEVICES
     }
@@ -228,25 +389,41 @@ def _read_imu(directory: Path) -> dict[str, np.ndarray]:
                 device = row[1].split("(", 1)[0].strip()
                 if device not in rows_by_device:
                     continue
-                values = [_safe_float(value) for value in row[2:8]]
-                if any(value is None for value in values):
+                base_values = [_safe_float(value) for value in row[2:8]]
+                if any(value is None for value in base_values):
                     continue
-                vector = np.asarray(values, dtype=np.float32)
+                vector = np.asarray(base_values, dtype=np.float32)
                 acc_magnitude = float(np.linalg.norm(vector[:3]))
                 gyro_magnitude = float(np.linalg.norm(vector[3:]))
+                optional = [_safe_float(value) for value in row[8:18]]
+                optional.extend([None] * (10 - len(optional)))
                 enriched = np.concatenate(
-                    (vector, np.asarray((acc_magnitude, gyro_magnitude), dtype=np.float32))
+                    (
+                        vector,
+                        np.asarray((acc_magnitude, gyro_magnitude), dtype=np.float32),
+                        np.asarray(
+                            [value if value is not None else np.nan for value in optional[:10]],
+                            dtype=np.float32,
+                        ),
+                    )
                 )
                 rows_by_device[device].append((_parse_time(row[0], sequence), enriched))
                 sequence += 1
 
-    result: dict[str, np.ndarray] = {}
+    result: dict[str, _IMUDeviceSeries] = {}
     for device, rows in rows_by_device.items():
         rows.sort(key=lambda item: item[0])
-        result[device] = (
-            np.stack([values for _, values in rows])
-            if rows
-            else np.empty((0, 8), dtype=np.float32)
+        result[device] = _IMUDeviceSeries(
+            timestamps=(
+                np.asarray([timestamp for timestamp, _ in rows], dtype=np.float64)
+                if rows
+                else np.empty(0, dtype=np.float64)
+            ),
+            values=(
+                np.stack([values for _, values in rows])
+                if rows
+                else np.empty((0, _IMU_EXTENDED_CHANNELS), dtype=np.float32)
+            ),
         )
     return result
 
@@ -287,18 +464,272 @@ def _signal_features(values: np.ndarray, temporal_bins: int) -> np.ndarray:
     return np.concatenate((global_features, np.asarray(temporal, dtype=np.float32)))
 
 
+def _interpolate_signal(values: np.ndarray) -> np.ndarray:
+    signal = np.asarray(values, dtype=np.float64)
+    valid = np.isfinite(signal)
+    if not valid.any():
+        return np.empty(0, dtype=np.float64)
+    if valid.all():
+        return signal
+    index = np.arange(len(signal), dtype=np.float64)
+    return np.interp(index, index[valid], signal[valid])
+
+
+def _resample_signal(values: np.ndarray, length: int) -> np.ndarray:
+    signal = _interpolate_signal(values)
+    if signal.size == 0:
+        return signal
+    if len(signal) == 1:
+        return np.full(length, signal[0], dtype=np.float64)
+    return np.interp(
+        np.linspace(0.0, 1.0, length),
+        np.linspace(0.0, 1.0, len(signal)),
+        signal,
+    )
+
+
+def _safe_correlation(first: np.ndarray, second: np.ndarray) -> float:
+    first_centered = first - np.mean(first)
+    second_centered = second - np.mean(second)
+    denominator = float(
+        np.sqrt(np.sum(first_centered**2) * np.sum(second_centered**2))
+    )
+    if denominator <= 1e-12:
+        return 0.0
+    return float(np.sum(first_centered * second_centered) / denominator)
+
+
+def _dynamic_signal_features(values: np.ndarray, samples: int) -> np.ndarray:
+    signal = _resample_signal(values, samples)
+    if signal.size == 0:
+        return np.full(_DYNAMIC_FEATURES, np.nan, dtype=np.float32)
+    centered = signal - np.mean(signal)
+    difference = np.diff(signal)
+    second_difference = np.diff(signal, n=2)
+    standard_deviation = float(np.std(centered))
+    if standard_deviation > 1e-12:
+        normalized = centered / standard_deviation
+        skewness = float(np.mean(normalized**3))
+        kurtosis = float(np.mean(normalized**4) - 3.0)
+        autocorrelation = _safe_correlation(centered[:-1], centered[1:])
+    else:
+        skewness = 0.0
+        kurtosis = 0.0
+        autocorrelation = 0.0
+
+    spectrum = np.abs(np.fft.rfft(centered)) ** 2
+    spectrum = spectrum[1:]
+    total_power = float(np.sum(spectrum))
+    if total_power > 1e-12:
+        probabilities = spectrum / total_power
+        dominant_frequency = float((np.argmax(spectrum) + 1) / max(1, len(spectrum)))
+        spectral_entropy = float(
+            -np.sum(probabilities * np.log(probabilities + 1e-12))
+            / math.log(max(2, len(probabilities)))
+        )
+        high_frequency_fraction = float(np.sum(spectrum[len(spectrum) // 2 :]) / total_power)
+    else:
+        dominant_frequency = 0.0
+        spectral_entropy = 0.0
+        high_frequency_fraction = 0.0
+    return np.asarray(
+        (
+            np.sqrt(np.mean(difference**2)) if difference.size else 0.0,
+            np.sqrt(np.mean(second_difference**2)) if second_difference.size else 0.0,
+            np.mean(np.signbit(centered[:-1]) != np.signbit(centered[1:]))
+            if len(centered) > 1
+            else 0.0,
+            skewness,
+            kurtosis,
+            autocorrelation,
+            dominant_frequency,
+            spectral_entropy,
+            high_frequency_fraction,
+        ),
+        dtype=np.float32,
+    )
+
+
+def _circular_features(values: np.ndarray, temporal_bins: int) -> np.ndarray:
+    signal = _interpolate_signal(values)
+    size = 5 + temporal_bins * 2
+    if signal.size == 0:
+        return np.full(size, np.nan, dtype=np.float32)
+    radians = np.deg2rad(signal)
+    sine = np.sin(radians)
+    cosine = np.cos(radians)
+    resultant = float(np.hypot(np.mean(sine), np.mean(cosine)))
+    unwrapped = np.unwrap(radians)
+    features = [
+        float(np.mean(sine)),
+        float(np.mean(cosine)),
+        resultant,
+        float(np.std(unwrapped) / np.pi),
+        float(np.ptp(unwrapped) / (2.0 * np.pi)),
+    ]
+    temporal_sine = _ensure_temporal_length(sine, temporal_bins)
+    temporal_cosine = _ensure_temporal_length(cosine, temporal_bins)
+    for sine_chunk, cosine_chunk in zip(
+        np.array_split(temporal_sine, temporal_bins),
+        np.array_split(temporal_cosine, temporal_bins),
+        strict=True,
+    ):
+        features.extend((float(np.mean(sine_chunk)), float(np.mean(cosine_chunk))))
+    return np.asarray(features, dtype=np.float32)
+
+
+def _quaternion_features(values: np.ndarray, config: FeatureConfig) -> np.ndarray:
+    size = 5 * (10 + config.temporal_bins * 2)
+    interpolated = _interpolate_columns(values)
+    if interpolated is None:
+        return np.full(size, np.nan, dtype=np.float32)
+    norms = np.linalg.norm(interpolated, axis=1)
+    valid = norms > 1e-8
+    if not valid.any():
+        return np.full(size, np.nan, dtype=np.float32)
+    quaternions = interpolated / np.maximum(norms[:, None], 1e-8)
+    for index in range(1, len(quaternions)):
+        if np.dot(quaternions[index - 1], quaternions[index]) < 0:
+            quaternions[index] *= -1.0
+    initial_conjugate = quaternions[0] * np.asarray((1.0, -1.0, -1.0, -1.0))
+    w1, x1, y1, z1 = np.moveaxis(quaternions, 1, 0)
+    w2, x2, y2, z2 = initial_conjugate
+    relative = np.column_stack(
+        (
+            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        )
+    )
+    orientation_step = np.zeros(len(quaternions), dtype=np.float64)
+    if len(quaternions) > 1:
+        dots = np.clip(np.abs(np.sum(quaternions[1:] * quaternions[:-1], axis=1)), 0.0, 1.0)
+        orientation_step[1:] = 2.0 * np.arccos(dots)
+    return np.concatenate(
+        [
+            *(
+                _signal_features(relative[:, channel], config.temporal_bins)
+                for channel in range(4)
+            ),
+            _signal_features(orientation_step, config.temporal_bins),
+        ]
+    ).astype(np.float32)
+
+
+def _vector_shape_features(values: np.ndarray) -> np.ndarray:
+    if len(values) == 0:
+        return np.full(6, np.nan, dtype=np.float32)
+    columns = np.column_stack([_interpolate_signal(values[:, index]) for index in range(3)])
+    if columns.shape[0] < 2:
+        return np.zeros(6, dtype=np.float32)
+    covariance = np.cov(columns, rowvar=False)
+    eigenvalues = np.linalg.eigvalsh(covariance)
+    pairwise = np.asarray(
+        (
+            _safe_correlation(columns[:, 0], columns[:, 1]),
+            _safe_correlation(columns[:, 0], columns[:, 2]),
+            _safe_correlation(columns[:, 1], columns[:, 2]),
+        )
+    )
+    return np.concatenate((eigenvalues, pairwise)).astype(np.float32)
+
+
+def _device_metadata(series: _IMUDeviceSeries) -> np.ndarray:
+    if len(series.timestamps) == 0:
+        return np.full(3, np.nan, dtype=np.float32)
+    duration = max(0.0, float(series.timestamps[-1] - series.timestamps[0]))
+    sample_rate = (len(series.timestamps) - 1) / duration if duration > 1e-9 else 0.0
+    return np.asarray((np.log1p(len(series.timestamps)), duration, sample_rate), dtype=np.float32)
+
+
+def _pairwise_device_features(
+    left: _IMUDeviceSeries,
+    right: _IMUDeviceSeries,
+    config: FeatureConfig,
+) -> np.ndarray:
+    features: list[float] = []
+    for channel in range(_IMU_BASE_CHANNELS):
+        left_signal = _resample_signal(left.values[:, channel], config.spectral_samples)
+        right_signal = _resample_signal(right.values[:, channel], config.spectral_samples)
+        if left_signal.size == 0 or right_signal.size == 0:
+            features.extend((np.nan, np.nan, np.nan))
+            continue
+        difference = left_signal - right_signal
+        correlation = _safe_correlation(left_signal, right_signal)
+        features.extend(
+            (
+                correlation,
+                float(np.sqrt(np.mean(difference**2))),
+                float(np.mean(np.abs(difference))),
+            )
+        )
+    return np.asarray(features, dtype=np.float32)
+
+
 def imu_feature_size(config: FeatureConfig) -> int:
     return len(EXPECTED_IMU_DEVICES) * 8 * (10 + config.temporal_bins * 2)
 
 
-def extract_imu_features(directory: Path, config: FeatureConfig) -> np.ndarray:
+def imu_engineered_feature_size(config: FeatureConfig) -> int:
+    signal_size = 10 + config.temporal_bins * 2
+    per_device = (
+        _IMU_BASE_CHANNELS * _DYNAMIC_FEATURES
+        + 3 * (5 + config.temporal_bins * 2)
+        + 5 * signal_size
+        + 3
+        + 12
+    )
+    device_pairs = 6
+    return len(EXPECTED_IMU_DEVICES) * per_device + device_pairs * _IMU_BASE_CHANNELS * 3
+
+
+def extract_imu_feature_pair(
+    directory: Path,
+    config: FeatureConfig,
+) -> tuple[np.ndarray, np.ndarray]:
     devices = _read_imu(directory)
-    features = [
-        _signal_features(devices[device][:, channel], config.temporal_bins)
+    base = [
+        _signal_features(devices[device].values[:, channel], config.temporal_bins)
         for device in EXPECTED_IMU_DEVICES
-        for channel in range(8)
+        for channel in range(_IMU_BASE_CHANNELS)
     ]
-    return np.concatenate(features).astype(np.float32)
+    engineered: list[np.ndarray] = []
+    for device in EXPECTED_IMU_DEVICES:
+        series = devices[device]
+        engineered.extend(
+            _dynamic_signal_features(series.values[:, channel], config.spectral_samples)
+            for channel in range(_IMU_BASE_CHANNELS)
+        )
+        engineered.extend(
+            _circular_features(series.values[:, channel], config.temporal_bins)
+            for channel in range(8, 11)
+        )
+        engineered.append(_quaternion_features(series.values[:, 14:18], config))
+        engineered.append(_device_metadata(series))
+        engineered.append(_vector_shape_features(series.values[:, :3]))
+        engineered.append(_vector_shape_features(series.values[:, 3:6]))
+
+    pair_names = (
+        ("WTLA", "WTRA"),
+        ("WTLL", "WTRL"),
+        ("WTLA", "WTC"),
+        ("WTRA", "WTC"),
+        ("WTLL", "WTC"),
+        ("WTRL", "WTC"),
+    )
+    engineered.extend(
+        _pairwise_device_features(devices[left], devices[right], config)
+        for left, right in pair_names
+    )
+    return (
+        np.concatenate(base).astype(np.float32),
+        np.concatenate(engineered).astype(np.float32),
+    )
+
+
+def extract_imu_features(directory: Path, config: FeatureConfig) -> np.ndarray:
+    return extract_imu_feature_pair(directory, config)[0]
 
 
 def _valid_people(payload: object) -> list[tuple[np.ndarray, np.ndarray]]:
@@ -360,10 +791,152 @@ def skeleton_feature_size(config: FeatureConfig) -> int:
     return config.skeleton_frames * (17 * 3 * 2 + 17)
 
 
-def extract_skeleton_features(directory: Path, config: FeatureConfig) -> np.ndarray:
+def skeleton_engineered_feature_size(config: FeatureConfig) -> int:
+    signal_size = 10 + config.temporal_bins * 2
+    geometry_signals = 24
+    joint_motion = 17 * 4
+    selected_acceleration = 5 * 4
+    confidence_and_count = 22
+    periodic_signals = 7 * _DYNAMIC_FEATURES
+    return (
+        geometry_signals * signal_size
+        + joint_motion
+        + selected_acceleration
+        + confidence_and_count
+        + periodic_signals
+    )
+
+
+def _joint_angle_cosine(
+    points: np.ndarray,
+    first: int,
+    center: int,
+    last: int,
+) -> np.ndarray:
+    first_vector = points[:, first] - points[:, center]
+    last_vector = points[:, last] - points[:, center]
+    denominator = np.linalg.norm(first_vector, axis=1) * np.linalg.norm(last_vector, axis=1)
+    cosine = np.sum(first_vector * last_vector, axis=1) / np.maximum(denominator, 1e-8)
+    return np.clip(cosine, -1.0, 1.0)
+
+
+def _skeleton_engineered_features(
+    pose_array: np.ndarray,
+    resampled_pose: np.ndarray,
+    resampled_scores: np.ndarray,
+    scale: float,
+    config: FeatureConfig,
+) -> np.ndarray:
+    points = resampled_pose.reshape(config.skeleton_frames, 17, 3)
+    angle_triplets = (
+        (5, 7, 9),
+        (6, 8, 10),
+        (7, 5, 11),
+        (8, 6, 12),
+        (5, 11, 13),
+        (6, 12, 14),
+        (11, 13, 15),
+        (12, 14, 16),
+    )
+    angles = np.column_stack(
+        [_joint_angle_cosine(points, *triplet) for triplet in angle_triplets]
+    )
+    distance_pairs = (
+        (9, 0),
+        (10, 0),
+        (9, 10),
+        (15, 16),
+        (9, 11),
+        (10, 12),
+        (5, 6),
+    )
+    distances = np.column_stack(
+        [
+            np.linalg.norm(points[:, first] - points[:, second], axis=1)
+            for first, second in distance_pairs
+        ]
+    )
+    roots = (points[:, 11] + points[:, 12]) / 2.0
+    shoulder_centers = (points[:, 5] + points[:, 6]) / 2.0
+    torso = shoulder_centers - roots
+    torso_unit = torso / np.maximum(np.linalg.norm(torso, axis=1)[:, None], 1e-8)
+    extents = np.max(points, axis=1) - np.min(points, axis=1)
+
+    original_roots = (pose_array[:, 11] + pose_array[:, 12]) / 2.0
+    resampled_roots = _resample(original_roots, config.skeleton_frames)
+    root_displacement = (resampled_roots - resampled_roots[:1]) / max(scale, 1e-6)
+    geometry = np.concatenate(
+        (angles, distances, torso_unit, extents, root_displacement),
+        axis=1,
+    )
+    features: list[np.ndarray] = [
+        _signal_features(geometry[:, channel], config.temporal_bins)
+        for channel in range(geometry.shape[1])
+    ]
+
+    velocity = np.diff(points, axis=0, prepend=points[:1])
+    speed = np.linalg.norm(velocity, axis=2)
+    motion_summary = np.column_stack(
+        (
+            np.mean(speed, axis=0),
+            np.std(speed, axis=0),
+            np.max(speed, axis=0),
+            np.sum(speed, axis=0),
+        )
+    ).ravel()
+    features.append(motion_summary.astype(np.float32))
+
+    acceleration = np.diff(velocity, axis=0, prepend=velocity[:1])
+    acceleration_norm = np.linalg.norm(acceleration, axis=2)
+    selected_joints = (0, 9, 10, 15, 16)
+    acceleration_summary = np.column_stack(
+        (
+            np.mean(acceleration_norm[:, selected_joints], axis=0),
+            np.std(acceleration_norm[:, selected_joints], axis=0),
+            np.max(acceleration_norm[:, selected_joints], axis=0),
+            np.sqrt(np.mean(acceleration_norm[:, selected_joints] ** 2, axis=0)),
+        )
+    ).ravel()
+    features.append(acceleration_summary.astype(np.float32))
+
+    confidence = np.asarray(
+        (
+            *np.mean(resampled_scores, axis=0),
+            np.mean(resampled_scores),
+            np.std(resampled_scores),
+            np.min(resampled_scores),
+            np.mean(resampled_scores < 0.5),
+            np.log1p(len(pose_array)),
+        ),
+        dtype=np.float32,
+    )
+    features.append(confidence)
+
+    periodic = [
+        root_displacement[:, 0],
+        root_displacement[:, 1],
+        root_displacement[:, 2],
+        speed[:, 9],
+        speed[:, 10],
+        speed[:, 15],
+        speed[:, 16],
+    ]
+    features.extend(
+        _dynamic_signal_features(signal, config.spectral_samples) for signal in periodic
+    )
+    return np.concatenate(features).astype(np.float32)
+
+
+def extract_skeleton_feature_pair(
+    directory: Path,
+    config: FeatureConfig,
+) -> tuple[np.ndarray, np.ndarray]:
     paths = sorted(directory.rglob("*.json"), key=_path_sort_key)
     if not paths:
-        return np.full(skeleton_feature_size(config), np.nan, dtype=np.float32)
+        return (
+            np.full(skeleton_feature_size(config), np.nan, dtype=np.float32),
+            np.full(skeleton_engineered_feature_size(config), np.nan, dtype=np.float32),
+        )
 
     poses: list[np.ndarray] = []
     scores: list[np.ndarray] = []
@@ -389,7 +962,10 @@ def extract_skeleton_features(directory: Path, config: FeatureConfig) -> np.ndar
     flat_pose = _interpolate_columns(pose_array.reshape(len(pose_array), -1))
     flat_scores = _interpolate_columns(score_array)
     if flat_pose is None or flat_scores is None:
-        return np.full(skeleton_feature_size(config), np.nan, dtype=np.float32)
+        return (
+            np.full(skeleton_feature_size(config), np.nan, dtype=np.float32),
+            np.full(skeleton_engineered_feature_size(config), np.nan, dtype=np.float32),
+        )
 
     pose_array = flat_pose.reshape(-1, 17, 3)
     roots = (pose_array[:, 11] + pose_array[:, 12]) / 2.0
@@ -402,24 +978,56 @@ def extract_skeleton_features(directory: Path, config: FeatureConfig) -> np.ndar
     resampled_pose = _resample(normalized.reshape(len(normalized), -1), config.skeleton_frames)
     resampled_scores = _resample(flat_scores, config.skeleton_frames)
     velocity = np.diff(resampled_pose, axis=0, prepend=resampled_pose[:1])
-    return np.concatenate(
+    base = np.concatenate(
         (resampled_pose.ravel(), velocity.ravel(), resampled_scores.ravel())
     ).astype(np.float32)
+    return (
+        base,
+        _skeleton_engineered_features(
+            pose_array,
+            resampled_pose,
+            resampled_scores,
+            scale,
+            config,
+        ),
+    )
+
+
+def extract_skeleton_features(directory: Path, config: FeatureConfig) -> np.ndarray:
+    return extract_skeleton_feature_pair(directory, config)[0]
 
 
 def extract_clip_features(
     record: ClipRecord,
     config: FeatureConfig,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray | None, ...]:
+    depth, depth_engineered = extract_image_feature_pair(
+        record.depth_dir,
+        config,
+        include_color=True,
+    )
+    assert depth is not None
+    infrared, ir_engineered = extract_image_feature_pair(
+        record.ir_dir,
+        config,
+        include_color=False,
+        include_base=config.include_legacy_ir,
+    )
+    imu, imu_engineered = extract_imu_feature_pair(record.imu_dir, config)
+    skeleton, skeleton_engineered = extract_skeleton_feature_pair(record.skeleton_dir, config)
     return (
-        extract_image_features(record.depth_dir, config),
-        extract_image_features(record.ir_dir, config),
-        extract_imu_features(record.imu_dir, config),
-        extract_skeleton_features(record.skeleton_dir, config),
+        depth,
+        infrared,
+        imu,
+        skeleton,
+        depth_engineered,
+        ir_engineered,
+        imu_engineered,
+        skeleton_engineered,
     )
 
 
-def _extract_job(args: tuple[ClipRecord, FeatureConfig]) -> tuple[np.ndarray, ...]:
+def _extract_job(args: tuple[ClipRecord, FeatureConfig]) -> tuple[np.ndarray | None, ...]:
     return extract_clip_features(*args)
 
 
@@ -427,7 +1035,7 @@ def _progressive_results(
     records: Sequence[ClipRecord],
     config: FeatureConfig,
     n_jobs: int,
-) -> Iterator[tuple[np.ndarray, ...]]:
+) -> Iterator[tuple[np.ndarray | None, ...]]:
     jobs = ((record, config) for record in records)
     if n_jobs == 1:
         for job in jobs:
@@ -454,14 +1062,32 @@ def extract_feature_bundle(
     infrared: list[np.ndarray] = []
     imu: list[np.ndarray] = []
     skeleton: list[np.ndarray] = []
+    depth_engineered: list[np.ndarray] = []
+    ir_engineered: list[np.ndarray] = []
+    imu_engineered: list[np.ndarray] = []
+    skeleton_engineered: list[np.ndarray] = []
     for index, values in enumerate(
         _progressive_results(records, active_config, n_jobs), start=1
     ):
-        depth_value, ir_value, imu_value, skeleton_value = values
+        (
+            depth_value,
+            ir_value,
+            imu_value,
+            skeleton_value,
+            depth_engineered_value,
+            ir_engineered_value,
+            imu_engineered_value,
+            skeleton_engineered_value,
+        ) = values
         depth.append(depth_value)
-        infrared.append(ir_value)
+        if ir_value is not None:
+            infrared.append(ir_value)
         imu.append(imu_value)
         skeleton.append(skeleton_value)
+        depth_engineered.append(depth_engineered_value)
+        ir_engineered.append(ir_engineered_value)
+        imu_engineered.append(imu_engineered_value)
+        skeleton_engineered.append(skeleton_engineered_value)
         if progress_every > 0 and (index % progress_every == 0 or index == len(records)):
             print(f"Extracted {index:,}/{len(records):,} clips", flush=True)
 
@@ -469,9 +1095,13 @@ def extract_feature_bundle(
     return RawFeatureBundle(
         clip_ids=np.asarray([record.clip_id for record in records]),
         depth=np.stack(depth),
-        ir=np.stack(infrared),
+        ir=np.stack(infrared) if infrared else None,
         imu=np.stack(imu),
         skeleton=np.stack(skeleton),
+        depth_engineered=np.stack(depth_engineered),
+        ir_engineered=np.stack(ir_engineered),
+        imu_engineered=np.stack(imu_engineered),
+        skeleton_engineered=np.stack(skeleton_engineered),
         labels=(
             np.asarray([record.label for record in records], dtype=np.int64)
             if is_train

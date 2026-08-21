@@ -1,8 +1,8 @@
 # Extensible multimodal training
 
-This module compares classification algorithms on a shared 384-dimensional
-representation of Depth Color, IR, IMU, and Skeleton data. Training uses a
-strict complete-case filter:
+This module compares classification algorithms on a shared representation of
+Depth Color, IR, IMU, and Skeleton data. Training uses a strict complete-case
+filter:
 
 - all four modality directories must contain data;
 - both IMU files must contain rows;
@@ -16,17 +16,34 @@ some additional clips have only partial IMU device coverage.
 
 ## Features
 
-- Depth Color and IR: grayscale 64x48 frames, five temporal summaries, an
-  in-repository NumPy Histogram of Oriented Gradients implementation, coarse
-  intensity grids, and percentiles.
-- IMU: time-sorted accelerometer and gyroscope axes plus magnitudes, global
-  statistics, and four-bin temporal statistics for each of five devices.
-- Skeleton: primary-person tracking, hip centering, torso normalization,
-  interpolation to 32 frames, positions, velocities, and confidence scores.
+- Depth Color base features: grayscale 64x48 frames, five temporal summaries,
+  an in-repository NumPy Histogram of Oriented Gradients implementation,
+  coarse intensity grids, and percentiles. The equivalent legacy IR block is
+  disabled after grouped validation showed no benefit.
+- Image engineered features: four-bin temporal pyramids containing appearance,
+  absolute motion, signed motion, and motion-centroid grids. Depth Color also
+  retains HSV spatial summaries and histograms instead of discarding the
+  colorized depth encoding.
+- IMU base features: time-sorted accelerometer and gyroscope axes plus
+  magnitudes, global statistics, and four-bin temporal statistics for each of
+  five devices.
+- IMU engineered features: jerk and spectral summaries, circular Euler-angle
+  statistics, relative quaternion motion, per-device covariance, sampling
+  metadata, and left/right or limb/torso agreement features.
+- Skeleton base features: primary-person tracking, hip centering, torso
+  normalization, interpolation to 32 frames, positions, velocities, and
+  confidence scores.
+- Skeleton engineered features: joint angles and distances, torso geometry,
+  root displacement, per-joint speed and acceleration, confidence summaries,
+  and periodic-motion statistics.
 
-Each modality is independently mean-imputed, standardized, and reduced with
-PCA. The four blocks produce the same 384 inputs for every registered
-algorithm, keeping comparisons consistent.
+The three active high-dimensional base blocks are independently mean-imputed,
+standardized, and reduced with PCA to 320 total components. The four compact
+engineered blocks are independently imputed and standardized, then passed
+through without sharing a PCA projection with the base features. With the
+default configuration, every registered algorithm receives 2,833 inputs.
+Models created before this change remain loadable: prediction automatically
+re-enables the legacy IR extractor when an older model requires that block.
 
 ## Install
 
@@ -50,7 +67,7 @@ python -m modeling.train \
 The command performs participant-grouped cross-validation, fits the final
 model, and writes:
 
-- `artifacts/features/four_sensor_v1.npz`: algorithm-independent feature cache;
+- `artifacts/features/four_sensor_v3.npz`: algorithm-independent feature cache;
 - `artifacts/logreg/model.joblib`: fitted preprocessing and classifier;
 - `artifacts/logreg/validation.json`: metrics and confusion matrix;
 - `outputs/logreg_submission.csv`: predictions in test CSV order.

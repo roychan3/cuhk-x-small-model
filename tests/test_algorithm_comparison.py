@@ -163,9 +163,9 @@ else:
             if not path.is_file():
                 self.skipTest("No real validation.json yet (run modeling.train first)")
             report = json.loads(path.read_text())
-            self.assertEqual(report["selected_parameters"], {"C": 0.01})
-            self.assertAlmostEqual(selected_metrics(report)["macro_f1"], 0.3896, places=3)
-            self.assertAlmostEqual(selected_metrics(report)["accuracy"], 0.4538, places=3)
+            self.assertEqual(report["selected_parameters"], {"C": 0.1})
+            self.assertAlmostEqual(selected_metrics(report)["macro_f1"], 0.4765, places=3)
+            self.assertAlmostEqual(selected_metrics(report)["accuracy"], 0.5382, places=3)
 
     class FigureTests(unittest.TestCase):
         def test_confusion_figure_shapes(self) -> None:

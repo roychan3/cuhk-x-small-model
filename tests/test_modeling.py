@@ -23,11 +23,17 @@ try:
     from modeling.features import (
         FeatureConfig,
         RawFeatureBundle,
+        extract_image_feature_pair,
         extract_image_features,
+        extract_imu_feature_pair,
         extract_imu_features,
+        extract_skeleton_feature_pair,
         extract_skeleton_features,
+        image_engineered_feature_size,
         image_feature_size,
+        imu_engineered_feature_size,
         imu_feature_size,
+        skeleton_engineered_feature_size,
         skeleton_feature_size,
     )
 except ImportError as exc:  # pragma: no cover - exercised only without the extras
@@ -45,6 +51,16 @@ IMU_HEADER = [
     "AsX(°/s)",
     "AsY(°/s)",
     "AsZ(°/s)",
+    "AngleX(°)",
+    "AngleY(°)",
+    "AngleZ(°)",
+    "MagX(uT)",
+    "MagY(uT)",
+    "MagZ(uT)",
+    "Q0",
+    "Q1",
+    "Q2",
+    "Q3",
 ]
 
 
@@ -64,6 +80,16 @@ def write_imu(path: Path, devices: tuple[str, ...]) -> None:
                     index + 1.1,
                     index + 1.2,
                     index + 1.3,
+                    index * 10.0,
+                    index * 5.0,
+                    index * 2.0,
+                    1.0,
+                    2.0,
+                    3.0,
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0,
                 ]
             )
 
@@ -90,6 +116,37 @@ class FeatureExtractionTests(unittest.TestCase):
         self.assertEqual(features.shape, (image_feature_size(config),))
         self.assertTrue(np.isfinite(features).all())
 
+    def test_color_image_engineered_features_have_fixed_size(self) -> None:
+        config = FeatureConfig()
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            for index in range(4):
+                array = np.zeros((48, 64, 3), dtype=np.uint8)
+                array[:, : 16 + index * 8, index % 3] = 80 + index * 40
+                Image.fromarray(array).save(directory / f"Depth_2025-01-01_00-00-0{index}.000_{index}.png")
+            base, engineered = extract_image_feature_pair(
+                directory,
+                config,
+                include_color=True,
+            )
+            omitted_base, engineered_only = extract_image_feature_pair(
+                directory,
+                config,
+                include_color=False,
+                include_base=False,
+            )
+        self.assertEqual(base.shape, (image_feature_size(config),))
+        self.assertEqual(
+            engineered.shape,
+            (image_engineered_feature_size(config, include_color=True),),
+        )
+        self.assertTrue(np.isfinite(engineered).all())
+        self.assertIsNone(omitted_base)
+        self.assertEqual(
+            engineered_only.shape,
+            (image_engineered_feature_size(config, include_color=False),),
+        )
+
     def test_imu_features_cover_five_devices(self) -> None:
         config = FeatureConfig()
         with tempfile.TemporaryDirectory() as temporary:
@@ -99,6 +156,17 @@ class FeatureExtractionTests(unittest.TestCase):
             features = extract_imu_features(directory, config)
         self.assertEqual(features.shape, (imu_feature_size(config),))
         self.assertTrue(np.isfinite(features).all())
+
+    def test_imu_engineered_features_have_fixed_size(self) -> None:
+        config = FeatureConfig()
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            write_imu(directory / "down.csv", ("WTLL", "WTRL"))
+            write_imu(directory / "up.csv", ("WTLA", "WTRA", "WTC"))
+            base, engineered = extract_imu_feature_pair(directory, config)
+        self.assertEqual(base.shape, (imu_feature_size(config),))
+        self.assertEqual(engineered.shape, (imu_engineered_feature_size(config),))
+        self.assertTrue(np.isfinite(engineered).all())
 
     def test_skeleton_features_are_root_centered(self) -> None:
         config = FeatureConfig(skeleton_frames=4)
@@ -115,6 +183,21 @@ class FeatureExtractionTests(unittest.TestCase):
         positions = features[: config.skeleton_frames * 17 * 3].reshape(config.skeleton_frames, 17, 3)
         roots = (positions[:, 11] + positions[:, 12]) / 2.0
         np.testing.assert_allclose(roots, 0.0, atol=1e-5)
+
+    def test_skeleton_engineered_features_have_fixed_size(self) -> None:
+        config = FeatureConfig(skeleton_frames=4)
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / "predictions"
+            directory.mkdir(parents=True)
+            for index in range(5):
+                payload = [skeleton_person(float(index) * 0.1)]
+                (directory / f"Color_2025-01-01_00-00-0{index}.000_{index}.json").write_text(
+                    json.dumps(payload), encoding="utf-8"
+                )
+            base, engineered = extract_skeleton_feature_pair(directory.parent, config)
+        self.assertEqual(base.shape, (skeleton_feature_size(config),))
+        self.assertEqual(engineered.shape, (skeleton_engineered_feature_size(config),))
+        self.assertTrue(np.isfinite(engineered).all())
 
 
 class CompleteCaseDiscoveryTests(unittest.TestCase):
@@ -151,6 +234,7 @@ class FeatureCacheTests(unittest.TestCase):
             ir=np.ones((1, 3), dtype=np.float32),
             imu=np.ones((1, 4), dtype=np.float32),
             skeleton=np.ones((1, 5), dtype=np.float32),
+            imu_engineered=np.ones((1, 6), dtype=np.float32),
             labels=np.asarray([1]),
             groups=np.asarray(["user1"]),
         )
@@ -160,6 +244,7 @@ class FeatureCacheTests(unittest.TestCase):
             ir=np.ones((1, 3), dtype=np.float32),
             imu=np.ones((1, 4), dtype=np.float32),
             skeleton=np.ones((1, 5), dtype=np.float32),
+            imu_engineered=np.ones((1, 6), dtype=np.float32),
             submission_paths=np.asarray(["small_model_track_test/test/"]),
         )
         with tempfile.TemporaryDirectory() as temporary:
@@ -168,6 +253,7 @@ class FeatureCacheTests(unittest.TestCase):
             loaded_train, loaded_test = load_feature_cache(path, config)
         np.testing.assert_array_equal(loaded_train.labels, train.labels)
         np.testing.assert_array_equal(loaded_test.submission_paths, test.submission_paths)
+        np.testing.assert_array_equal(loaded_train.imu_engineered, train.imu_engineered)
 
 
 class AlgorithmRegistryTests(unittest.TestCase):

@@ -22,7 +22,7 @@ from visualization.dataset import resolve_dataset_root
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_FEATURE_CACHE = REPOSITORY_ROOT / "artifacts" / "features" / "four_sensor_v1.npz"
+DEFAULT_FEATURE_CACHE = REPOSITORY_ROOT / "artifacts" / "features" / "four_sensor_v3.npz"
 
 
 def parse_args(default_algorithm: str = "logistic_regression") -> argparse.Namespace:
@@ -240,6 +240,10 @@ def main(default_algorithm: str = "logistic_regression") -> int:
             "training_clips": len(training_records),
             "test_clips": len(test_records),
             "class_counts": counts,
+            "raw_feature_dimensions": {
+                name: int(values.shape[1])
+                for name, values in train_bundle.modality_arrays().items()
+            },
             "test_feature_health": test_feature_health,
             "library_versions": library_versions(),
         }

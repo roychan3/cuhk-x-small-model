@@ -239,8 +239,10 @@ def _leaderboard_csv(rows: list[dict[str, object]]) -> str:
 def render_algorithm_comparison() -> None:
     st.header("Algorithm comparison")
     st.caption(
-        "Compare every trained algorithm on the shared 384-dim multimodal "
-        "representation (Depth Color · IR · IMU · Skeleton). "
+        "Compare every trained algorithm on the shared multimodal representation "
+        "built from Depth Color, IR, IMU, and Skeleton — PCA-reduced base blocks "
+        "plus pass-through engineered features. Widths depend on the feature "
+        "configuration; each report records its own under `raw_feature_dimensions`. "
         "Each run writes `artifacts/<algorithm>/validation.json`; "
         "this page and `python -m modeling.compare` read the same files. "
         "Add a new algorithm under `modeling/algorithms/` and rerun "

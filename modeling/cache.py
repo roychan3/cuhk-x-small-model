@@ -10,7 +10,7 @@ import numpy as np
 from modeling.features import FeatureConfig, RawFeatureBundle, feature_config_dict
 
 
-CACHE_VERSION = 1
+CACHE_VERSION = 3
 
 
 def save_feature_cache(
@@ -25,24 +25,24 @@ def save_feature_cache(
         raise ValueError("Training bundle is missing labels or groups")
     if test.submission_paths is None:
         raise ValueError("Test bundle is missing submission paths")
-    np.savez(
-        output,
-        cache_version=np.asarray(CACHE_VERSION),
-        feature_config=np.asarray(json.dumps(feature_config_dict(config), sort_keys=True)),
-        train_clip_ids=train.clip_ids,
-        train_depth=train.depth,
-        train_ir=train.ir,
-        train_imu=train.imu,
-        train_skeleton=train.skeleton,
-        train_labels=train.labels,
-        train_groups=train.groups,
-        test_clip_ids=test.clip_ids,
-        test_depth=test.depth,
-        test_ir=test.ir,
-        test_imu=test.imu,
-        test_skeleton=test.skeleton,
-        test_submission_paths=test.submission_paths,
-    )
+    train_arrays = train.modality_arrays()
+    test_arrays = test.modality_arrays()
+    if tuple(train_arrays) != tuple(test_arrays):
+        raise ValueError("Training and test bundles have different feature blocks")
+    payload: dict[str, np.ndarray] = {
+        "cache_version": np.asarray(CACHE_VERSION),
+        "feature_config": np.asarray(json.dumps(feature_config_dict(config), sort_keys=True)),
+        "feature_blocks": np.asarray(json.dumps(list(train_arrays))),
+        "train_clip_ids": train.clip_ids,
+        "train_labels": train.labels,
+        "train_groups": train.groups,
+        "test_clip_ids": test.clip_ids,
+        "test_submission_paths": test.submission_paths,
+    }
+    for name in train_arrays:
+        payload[f"train_{name}"] = train_arrays[name]
+        payload[f"test_{name}"] = test_arrays[name]
+    np.savez(output, **payload)
     return output
 
 
@@ -59,21 +59,36 @@ def load_feature_cache(
             raise ValueError(f"Feature cache version {version} is not supported")
         if cached_config != expected_config:
             raise ValueError("Feature cache configuration does not match the active configuration")
+        feature_blocks = json.loads(str(data["feature_blocks"]))
+        if not isinstance(feature_blocks, list) or not all(
+            isinstance(name, str) for name in feature_blocks
+        ):
+            raise ValueError("Feature cache has an invalid block list")
+        required = {"depth", "imu", "skeleton"}
+        supported = required | {
+            "ir",
+            "depth_engineered",
+            "ir_engineered",
+            "imu_engineered",
+            "skeleton_engineered",
+        }
+        if not required.issubset(feature_blocks):
+            raise ValueError("Feature cache is missing a required base block")
+        if len(feature_blocks) != len(set(feature_blocks)) or not set(feature_blocks) <= supported:
+            raise ValueError("Feature cache contains unsupported or duplicate blocks")
+        train_arrays = {name: data[f"train_{name}"].copy() for name in feature_blocks}
+        test_arrays = {name: data[f"test_{name}"].copy() for name in feature_blocks}
         train = RawFeatureBundle(
             clip_ids=data["train_clip_ids"].copy(),
-            depth=data["train_depth"].copy(),
-            ir=data["train_ir"].copy(),
-            imu=data["train_imu"].copy(),
-            skeleton=data["train_skeleton"].copy(),
+            ir=train_arrays.pop("ir", None),
             labels=data["train_labels"].copy(),
             groups=data["train_groups"].copy(),
+            **train_arrays,
         )
         test = RawFeatureBundle(
             clip_ids=data["test_clip_ids"].copy(),
-            depth=data["test_depth"].copy(),
-            ir=data["test_ir"].copy(),
-            imu=data["test_imu"].copy(),
-            skeleton=data["test_skeleton"].copy(),
+            ir=test_arrays.pop("ir", None),
             submission_paths=data["test_submission_paths"].copy(),
+            **test_arrays,
         )
     return train, test

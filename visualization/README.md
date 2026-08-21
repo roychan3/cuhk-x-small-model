@@ -62,7 +62,7 @@ Progressive loading requires extracted directory sources. ZIP sources fall back 
 * Confusion matrix (40×40, row-normalized toggle) + Δ recall `A−B` heatmap and per-class F1
 * Cross-validation folds (line per fold + aggregate table) and run metadata (`test_feature_health`, `class_counts`, full JSON)
 
-Add a new algorithm under `modeling/algorithms/` and rerun `python -m modeling.train --algorithm <name>` — it appears with no dashboard code change. Real scores from the reference run: `logistic_regression` (`C=0.01`) → `accuracy 0.4539, macro_f1 0.3896, balanced_accuracy 0.3845` on 2,785 training clips (see `artifacts/logreg/validation.json`). If the container is used only to read existing validation reports and an existing dataset manifest, the artifacts mount can be read-only:
+Add a new algorithm under `modeling/algorithms/` and rerun `python -m modeling.train --algorithm <name>` — it appears with no dashboard code change. Real scores from the expanded-feature reference run: `logistic_regression` (`C=0.1`) → `accuracy 0.5382, macro_f1 0.4765, balanced_accuracy 0.4694` on 2,785 training clips (see `artifacts/logreg/validation.json`). If the container is used only to read existing validation reports and an existing dataset manifest, the artifacts mount can be read-only:
 
 ```bash
 docker run -d --rm --name cuhkx-dev -p 127.0.0.1:8501:8501 \
