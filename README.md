@@ -216,17 +216,28 @@ generation or rebuild the manifest; the dashboard reports the failed build
 instead of stopping.
 
 Then open <http://localhost:8501>. See `visualization/README.md` for the
-module-specific commands and layout. Real scores from the expanded-feature
-reference run: `logistic_regression` `C=0.1` → `accuracy 0.5382, macro_f1
-0.4765` on 2,785 clips.
+module-specific commands and layout. Real scores on 2,785 clips, both measured
+the same way — three repeated grouped splits, averaged over repeats, so each
+number describes one fitted model:
 
-## Logistic-regression baseline
+| Run | accuracy | macro-F1 | balanced accuracy |
+| --- | --- | --- | --- |
+| `logistic_regression` (`C=0.1`) | 0.5370 | 0.4751 | 0.4681 |
+| `late_fusion` (`C=0.03`, combined `C=0.1`, `stacked`) | 0.5587 | 0.4949 | 0.4897 |
+
+Quote scores only against runs with the same `cv_repeats`: a single split puts
+`logistic_regression` at `accuracy 0.5382, macro_f1 0.4765`, which is within the
+repeat-to-repeat spread rather than a real difference.
+
+## Modeling baselines
 
 The `modeling/` module provides an extensible four-modality training framework
 using Depth Color, IR, IMU, and Skeleton features. It strictly filters
 incomplete training clips, validates by held-out participant groups, shares a
 feature cache across registered algorithms, and writes submissions in test CSV
-order. Logistic regression is the initial registered algorithm.
+order. The registered comparisons are multinomial logistic regression and
+modality-level late fusion. Both consume the same cached feature representation
+and preserve the submission/artifact formats.
 
 Install and run it from the repository root:
 
@@ -237,6 +248,16 @@ pip install -r modeling/requirements.txt
 python -m modeling.train \
   --algorithm logistic_regression \
   --dataset-root /path/to/small-model \
+  --n-jobs 8
+```
+
+For a repeated same-feature comparison:
+
+```bash
+python -m modeling.train \
+  --algorithm late_fusion \
+  --dataset-root /path/to/small-model \
+  --cv-repeats 3 \
   --n-jobs 8
 ```
 
@@ -260,10 +281,10 @@ There are five suites with different requirements:
 | `tests/test_predictions.py` | 7 | standard library only | always runs |
 | `tests/test_comparison_format.py` | 13 | standard library only | always runs; its 2 CLI-parity tests skip without `modeling/requirements.txt` |
 | `tests/test_algorithm_comparison.py` | 16 | `visualization/requirements.txt` + `numpy` (for confusion-matrix math) | collapses to 1 skip |
-| `tests/test_modeling.py` | 14 | `modeling/requirements.txt` | collapses to 1 skip |
+| `tests/test_modeling.py` | 21 | `modeling/requirements.txt` | collapses to 1 skip |
 
 So a bare interpreter reports `Ran 37 tests ... OK (skipped=4)`, while an
-interpreter with `visualization` + `modeling` deps reports `Ran 65 tests ... OK`
+interpreter with `visualization` + `modeling` deps reports `Ran 72 tests ... OK`
 (`skipped=1` when the optional real validation artifact is absent). A skip is
 expected, not a failure. Install the extras to run
 everything:

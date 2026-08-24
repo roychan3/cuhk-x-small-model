@@ -17,7 +17,13 @@ from modeling.algorithms import available_algorithms, get_algorithm
 from modeling.cache import load_feature_cache, save_feature_cache
 from modeling.data import class_counts, discover_test_clips, discover_training_clips
 from modeling.features import FeatureConfig, RawFeatureBundle, extract_feature_bundle
-from modeling.model import cross_validate, fit_final_model, library_versions, save_model
+from modeling.model import (
+    cross_validate_detailed,
+    fit_final_model,
+    library_versions,
+    save_model,
+    save_validation_outputs,
+)
 from visualization.dataset import resolve_dataset_root
 
 
@@ -46,6 +52,12 @@ def parse_args(default_algorithm: str = "logistic_regression") -> argparse.Names
     parser.add_argument("--n-jobs", type=int, default=min(8, os.cpu_count() or 1))
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument(
+        "--cv-repeats",
+        type=int,
+        default=1,
+        help="Repeat participant-grouped cross-validation with consecutive seeds.",
+    )
+    parser.add_argument(
         "--search-space",
         default=None,
         help=(
@@ -63,7 +75,14 @@ def parse_args(default_algorithm: str = "logistic_regression") -> argparse.Names
     parser.add_argument("--rebuild-features", action="store_true")
     parser.add_argument("--extract-only", action="store_true")
     parser.add_argument("--skip-validation", action="store_true")
-    return parser.parse_args()
+    arguments = parser.parse_args()
+    # cross_validate_detailed() rejects these too, but --skip-validation never
+    # reaches it, so a nonsense value would otherwise be accepted in silence.
+    if arguments.folds < 2:
+        parser.error("--folds must be at least 2")
+    if arguments.cv_repeats < 1:
+        parser.error("--cv-repeats must be at least 1")
+    return arguments
 
 
 def _parse_json_mapping(value: str | None, label: str) -> dict[str, Any] | None:
@@ -157,6 +176,7 @@ def main(default_algorithm: str = "logistic_regression") -> int:
     cache_path = args.features_cache.expanduser()
     model_path = artifacts_dir / "model.joblib"
     report_path = artifacts_dir / "validation.json"
+    oof_path = artifacts_dir / "oof_predictions.npz"
 
     print(f"Algorithm: {algorithm.display_name} ({algorithm.name})")
     print(f"Dataset root: {dataset_root}")
@@ -210,6 +230,7 @@ def main(default_algorithm: str = "logistic_regression") -> int:
         selected_parameters = algorithm.resolved_parameters(
             _parse_json_mapping(args.parameters, "--parameters")
         )
+        validation_outputs = None
         report: dict[str, object] = {
             "algorithm": algorithm.name,
             "selection_metric": None,
@@ -218,11 +239,12 @@ def main(default_algorithm: str = "logistic_regression") -> int:
         }
     else:
         candidates = algorithm.parameter_candidates(_search_space(args.search_space))
-        selected_parameters, report = cross_validate(
+        selected_parameters, report, validation_outputs = cross_validate_detailed(
             train_bundle,
             algorithm,
             candidates,
             n_splits=args.folds,
+            n_repeats=args.cv_repeats,
             random_state=args.random_state,
             selection_metric=args.selection_metric,
         )
@@ -232,6 +254,9 @@ def main(default_algorithm: str = "logistic_regression") -> int:
         )
 
     artifacts_dir.mkdir(parents=True, exist_ok=True)
+    if validation_outputs is not None:
+        save_validation_outputs(validation_outputs, oof_path)
+        report["oof_predictions"] = str(oof_path)
     report.update(
         {
             "algorithm": algorithm.name,
@@ -264,6 +289,8 @@ def main(default_algorithm: str = "logistic_regression") -> int:
     _write_submission(output_path, test_bundle.submission_paths, predictions)
     print(f"Saved model: {model_path}")
     print(f"Saved validation report: {report_path}")
+    if validation_outputs is not None:
+        print(f"Saved out-of-fold predictions: {oof_path}")
     print(f"Saved submission: {output_path}")
     return 0
 

@@ -25,6 +25,25 @@ class TrainingAlgorithm(ABC):
     def build_estimator(self, parameters: Mapping[str, Any], random_state: int) -> Any:
         """Return an unfitted estimator implementing fit() and predict()."""
 
+    def fit_estimator(
+        self,
+        features: Any,
+        labels: Any,
+        parameters: Mapping[str, Any],
+        random_state: int,
+        feature_groups: Mapping[str, Any] | None = None,
+    ) -> Any:
+        """Fit an estimator, optionally using named feature-column groups.
+
+        Ordinary algorithms ignore ``feature_groups``. Fusion algorithms can
+        override this hook while retaining the same training and validation
+        framework as every other registered algorithm.
+        """
+
+        estimator = self.build_estimator(parameters, random_state)
+        estimator.fit(features, labels)
+        return estimator
+
     def parameter_candidates(
         self,
         search_space: Mapping[str, Sequence[Any]] | None = None,

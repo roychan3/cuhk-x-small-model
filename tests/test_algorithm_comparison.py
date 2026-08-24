@@ -164,8 +164,18 @@ else:
                 self.skipTest("No real validation.json yet (run modeling.train first)")
             report = json.loads(path.read_text())
             self.assertEqual(report["selected_parameters"], {"C": 0.1})
-            self.assertAlmostEqual(selected_metrics(report)["macro_f1"], 0.4765, places=3)
-            self.assertAlmostEqual(selected_metrics(report)["accuracy"], 0.5382, places=3)
+            # ``metrics`` is the mean over repeats, so each repeat count has its
+            # own reference. An unrecorded count must fail rather than fall
+            # through to whichever branch happens to be left.
+            reference = {
+                1: {"macro_f1": 0.4765, "accuracy": 0.5382},
+                3: {"macro_f1": 0.4751, "accuracy": 0.5370},
+            }
+            repeats = report.get("cv_repeats", 1)
+            self.assertIn(repeats, reference, f"No reference scores for cv_repeats={repeats}")
+            metrics = selected_metrics(report)
+            for name, expected in reference[repeats].items():
+                self.assertAlmostEqual(metrics[name], expected, places=3)
 
     class FigureTests(unittest.TestCase):
         def test_confusion_figure_shapes(self) -> None:

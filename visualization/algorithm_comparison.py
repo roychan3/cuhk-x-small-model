@@ -89,22 +89,37 @@ def cached_validation_reports(report_paths: tuple[str, ...]) -> list[dict[str, A
     return reports
 
 
+def _class_ids(report: dict[str, Any]) -> list[int]:
+    """Class id behind each confusion-matrix row.
+
+    Reports written since the repeated-validation change carry ``classes``
+    explicitly, because the matrix covers only the classes that survived the
+    strict modality filter. Older reports covered ``0..max`` with zero rows for
+    absent classes, so position and id coincide there.
+    """
+
+    n = len(report.get("confusion_matrix", []))
+    recorded = report.get("classes")
+    if isinstance(recorded, list) and len(recorded) == n:
+        return [int(value) for value in recorded]
+    return list(range(n))
+
+
 def _class_labels(report: dict[str, Any]) -> list[str]:
-    # Prefer mapping in Training/class_mapping.csv, fall back to 0..n-1
+    # Prefer mapping in Training/class_mapping.csv, fall back to the class ids
+    class_ids = _class_ids(report)
     try:
         mapping_path = REPOSITORY_ROOT / "Training" / "class_mapping.csv"
         if mapping_path.is_file():
             with mapping_path.open(encoding="utf-8-sig", newline="") as handle:
                 reader = csv.DictReader(handle)
                 id_to_name = {int(r["action_id"]): r["action_name"] for r in reader}
-            n = len(report.get("confusion_matrix", []))
-            if n and len(id_to_name) >= n:
-                return [id_to_name.get(i, str(i)) for i in range(n)]
+            if class_ids and len(id_to_name) >= len(class_ids):
+                return [id_to_name.get(i, str(i)) for i in class_ids]
     except Exception:
         pass
-    n = len(report.get("confusion_matrix", []))
-    if n:
-        return [str(i) for i in range(n)]
+    if class_ids:
+        return [str(i) for i in class_ids]
     return [str(i) for i in range(40)]
 
 
@@ -451,7 +466,7 @@ def render_algorithm_comparison() -> None:
             try:
                 import numpy as np
 
-                def _per_class_f1(cm: list[list[int]]) -> pd.DataFrame:
+                def _per_class_f1(cm: list[list[int]], class_ids: list[int]) -> pd.DataFrame:
                     arr = np.asarray(cm, dtype=float)
                     n = arr.shape[0]
                     precisions: list[float] = []
@@ -467,12 +482,12 @@ def render_algorithm_comparison() -> None:
                         precisions.append(prec)
                         recalls.append(rec)
                         f1s.append(f1)
-                    return pd.DataFrame({"class_id": range(n), "precision": precisions, "recall": recalls, "f1": f1s})
+                    return pd.DataFrame({"class_id": class_ids[:n], "precision": precisions, "recall": recalls, "f1": f1s})
 
-                df_a = _per_class_f1(rep_a["confusion_matrix"])
+                df_a = _per_class_f1(rep_a["confusion_matrix"], _class_ids(rep_a))
                 df_a["run"] = algo_a
                 if algo_a != algo_b:
-                    df_b = _per_class_f1(rep_b["confusion_matrix"])
+                    df_b = _per_class_f1(rep_b["confusion_matrix"], _class_ids(rep_b))
                     df_b["run"] = algo_b
                     combined = pd.concat([df_a, df_b], ignore_index=True)
                     fig = px.bar(combined, x="class_id", y="f1", color="run", barmode="group")

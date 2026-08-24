@@ -45,6 +45,17 @@ default configuration, every registered algorithm receives 2,833 inputs.
 Models created before this change remain loadable: prediction automatically
 re-enables the legacy IR extractor when an older model requires that block.
 
+Registered algorithms include the original multinomial logistic regression and
+modality-level late fusion. Both use these same cached feature blocks.
+Late fusion trains one classifier per Depth, IR, IMU, and Skeleton group and
+blends their probabilities with the original combined-feature classifier; it
+does not add another feature extractor. On the reference data, modality
+`C=0.03`, combined `C=0.1`, and the `stacked` weighting profile reach `accuracy
+0.5587, macro_f1 0.4949, balanced_accuracy 0.4897` with three repeated grouped
+splits, compared with `0.5370 / 0.4751 / 0.4681` for the original logistic
+regression under the same repeated evaluation. Both figures are means over the
+three repeats, so both describe a single fitted model.
+
 ## Install
 
 From the repository root:
@@ -70,6 +81,8 @@ model, and writes:
 - `artifacts/features/four_sensor_v3.npz`: algorithm-independent feature cache;
 - `artifacts/logreg/model.joblib`: fitted preprocessing and classifier;
 - `artifacts/logreg/validation.json`: metrics and confusion matrix;
+- `artifacts/logreg/oof_predictions.npz`: clip-aligned out-of-fold predictions,
+  probabilities, repeat predictions, and fold assignments;
 - `outputs/logreg_submission.csv`: predictions in test CSV order.
 
 Override the comparison grid with JSON:
@@ -79,6 +92,17 @@ python -m modeling.train \
   --algorithm logistic_regression \
   --search-space '{"C": [0.01, 0.1, 1.0]}'
 ```
+
+Run a stronger same-feature comparison with repeated grouped validation:
+
+```bash
+python -m modeling.train \
+  --algorithm late_fusion \
+  --cv-repeats 3
+```
+
+Each algorithm writes to its own artifact/output directory and appears
+automatically in `python -m modeling.compare` and the dashboard.
 
 Feature extraction can be run by itself:
 
@@ -176,4 +200,25 @@ All scaling, imputation, and PCA fitting happens inside each validation fold.
 The validation groups are participants, preventing clips from one person from
 appearing in both training and validation data. Every algorithm report uses the
 same schema, including selected parameters, accuracy, macro-F1, balanced
-accuracy, per-fold metrics, and a confusion matrix.
+accuracy, per-fold metrics, per-class metrics, per-participant metrics, and a
+confusion matrix.
+
+`--cv-repeats` repeats the grouped split with consecutive deterministic seeds.
+Each repeat produces its own complete out-of-fold prediction, so a report at
+`cv_repeats > 1` carries three views of the same candidate:
+
+- `metrics` — the mean across repeats, and what candidate selection and the
+  leaderboard use. This is the number to quote: it estimates the single model
+  that `fit_final_model` actually trains and saves.
+- `metrics_std` and `repeat_metrics` — the spread and the individual repeats,
+  for judging whether a gap between two algorithms is larger than the noise.
+- `consensus_metrics` — the score after averaging probabilities across repeats.
+  That is an ensemble of `cv_repeats` models, which nothing here ships, so it
+  runs slightly ahead of `metrics` and is not comparable to a single-split run.
+
+`confusion_matrix`, `per_class_metrics`, and `per_group_metrics` are built from
+the consensus predictions (`detail_metrics_basis`), which is why they can differ
+from `metrics` in the last decimal. `classes` lists the class id behind each
+confusion-matrix row: those ids are contiguous only while every action survives
+the strict modality filter, so read positions through `classes` rather than
+assuming row *i* is action *i*.

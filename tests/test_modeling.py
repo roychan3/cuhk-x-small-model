@@ -6,6 +6,7 @@ import tempfile
 import unittest
 import warnings
 from pathlib import Path
+from unittest.mock import patch
 
 try:
     import numpy as np
@@ -16,9 +17,12 @@ try:
     from modeling.data import EXPECTED_IMU_DEVICES, discover_training_clips
     from modeling.model import (
         FittedMultimodalModel,
+        _majority_vote,
+        cross_validate_detailed,
         library_versions,
         load_model,
         save_model,
+        save_validation_outputs,
     )
     from modeling.features import (
         FeatureConfig,
@@ -273,6 +277,165 @@ class AlgorithmRegistryTests(unittest.TestCase):
         self.assertEqual(
             algorithm.parameter_candidates({"C": [0.5, 2.0]}),
             [{"C": 0.5}, {"C": 2.0}],
+        )
+
+    def test_same_feature_comparison_algorithms_are_registered(self) -> None:
+        self.assertEqual(available_algorithms(), ("late_fusion", "logistic_regression"))
+
+    def test_late_fusion_predicts_probabilities_from_named_groups(self) -> None:
+        features = np.asarray(
+            [
+                [-2.0, -1.0, -2.0, -1.0],
+                [-1.5, -1.0, -1.5, -1.0],
+                [-1.0, -0.5, -1.0, -0.5],
+                [-0.5, -0.5, -0.5, -0.5],
+                [0.5, 0.5, 0.5, 0.5],
+                [1.0, 0.5, 1.0, 0.5],
+                [1.5, 1.0, 1.5, 1.0],
+                [2.0, 1.0, 2.0, 1.0],
+            ],
+            dtype=np.float32,
+        )
+        labels = np.asarray([0, 0, 0, 0, 1, 1, 1, 1])
+        classifier = get_algorithm("late_fusion").fit_estimator(
+            features,
+            labels,
+            {"C": 1.0, "weighting": "equal"},
+            7,
+            {
+                "depth": np.asarray([0, 1]),
+                "imu": np.asarray([2, 3]),
+            },
+        )
+        probabilities = classifier.predict_proba(features)
+        self.assertEqual(probabilities.shape, (8, 2))
+        np.testing.assert_allclose(probabilities.sum(axis=1), 1.0)
+        np.testing.assert_array_equal(classifier.predict(features), labels)
+
+        stacked = get_algorithm("late_fusion").fit_estimator(
+            features,
+            labels,
+            {},
+            7,
+            {
+                "depth": np.asarray([0, 1]),
+                "imu": np.asarray([2, 3]),
+            },
+        )
+        self.assertIn("combined", stacked.estimators)
+        self.assertNotIn(
+            "combined",
+            stacked.feature_groups,
+            "fit() must not write the combined block back into the caller's groups",
+        )
+
+    def test_late_fusion_build_estimator_rejects_missing_groups(self) -> None:
+        with self.assertRaises(NotImplementedError):
+            get_algorithm("late_fusion").build_estimator({"C": 1.0}, 7)
+
+    def test_late_fusion_rejects_a_group_the_profile_cannot_weight(self) -> None:
+        features = np.repeat(np.asarray([[-1.0, 1.0]]), 8, axis=0)
+        labels = np.asarray([0, 0, 0, 0, 1, 1, 1, 1])
+        with self.assertRaises(ValueError) as caught:
+            get_algorithm("late_fusion").fit_estimator(
+                features,
+                labels,
+                {"weighting": "equal"},
+                7,
+                {"thermal": np.asarray([0, 1])},
+            )
+        self.assertIn("thermal", str(caught.exception))
+
+
+class CrossValidationOutputTests(unittest.TestCase):
+    def test_repeated_grouped_validation_saves_reusable_oof_outputs(self) -> None:
+        rng = np.random.default_rng(11)
+        labels = np.tile(np.asarray([0, 1, 0, 1]), 4)
+        groups = np.repeat(np.asarray(["u1", "u2", "u3", "u4"]), 4)
+
+        def block(width: int) -> np.ndarray:
+            signal = labels[:, None] * 2.0 - 1.0
+            return np.asarray(
+                signal + rng.normal(0.0, 0.1, size=(len(labels), width)),
+                dtype=np.float32,
+            )
+
+        bundle = RawFeatureBundle(
+            clip_ids=np.asarray([f"clip-{index}" for index in range(len(labels))]),
+            depth=block(8),
+            ir=None,
+            imu=block(8),
+            skeleton=block(8),
+            depth_engineered=block(4),
+            ir_engineered=block(4),
+            imu_engineered=block(4),
+            skeleton_engineered=block(4),
+            labels=labels,
+            groups=groups,
+        )
+        components = {"depth": 2, "imu": 2, "skeleton": 2}
+        with patch.dict("modeling.model.PCA_COMPONENTS", components, clear=True):
+            selected, report, outputs = cross_validate_detailed(
+                bundle,
+                get_algorithm("logistic_regression"),
+                [{"C": 0.1}],
+                n_splits=2,
+                n_repeats=2,
+                random_state=5,
+            )
+
+        self.assertEqual(selected, {"C": 0.1})
+        self.assertEqual(report["cv_repeats"], 2)
+        self.assertEqual(len(report["folds"]), 4)
+        self.assertEqual(len(report["per_class_metrics"]), 2)
+        self.assertEqual(len(report["per_group_metrics"]), 4)
+        self.assertEqual(report["classes"], [0, 1])
+        self.assertEqual(report["metrics_basis"], "mean_of_repeats")
+
+        # The headline metric must describe one model, like the one
+        # fit_final_model() ships, not the two-model repeat ensemble.
+        candidate = report["aggregate_metrics"][0]
+        for name, value in candidate["metrics"].items():
+            expected = float(
+                np.mean([repeat[name] for repeat in candidate["repeat_metrics"]])
+            )
+            self.assertAlmostEqual(value, expected, places=12)
+        self.assertEqual(set(candidate["consensus_metrics"]), set(candidate["metrics"]))
+        self.assertEqual(outputs.fold_assignments.shape, (2, len(labels)))
+        self.assertTrue((outputs.fold_assignments > 0).all())
+        self.assertEqual(outputs.repeat_predictions.shape, (2, len(labels)))
+        self.assertIsNotNone(outputs.probabilities)
+        self.assertEqual(outputs.probabilities.shape, (len(labels), 2))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "oof_predictions.npz"
+            save_validation_outputs(outputs, path)
+            with np.load(path, allow_pickle=False) as saved:
+                np.testing.assert_array_equal(saved["clip_ids"], bundle.clip_ids)
+                np.testing.assert_array_equal(saved["labels"], labels)
+                self.assertEqual(saved["probabilities"].shape, (len(labels), 2))
+
+    def test_majority_vote_does_not_always_break_ties_towards_the_low_class(self) -> None:
+        # Two repeats that disagree on every clip: argmax would hand every clip
+        # to class 3, the lower id.
+        predictions = np.asarray([[7] * 200, [3] * 200])
+        classes = np.asarray([3, 7])
+        consensus = _majority_vote(predictions, classes, random_state=5)
+
+        self.assertEqual(set(np.unique(consensus)), {3, 7})
+        share = float((consensus == 3).mean())
+        self.assertGreater(share, 0.3)
+        self.assertLess(share, 0.7)
+        np.testing.assert_array_equal(
+            consensus,
+            _majority_vote(predictions, classes, random_state=5),
+        )
+
+    def test_majority_vote_respects_an_actual_majority(self) -> None:
+        predictions = np.asarray([[7, 3], [3, 3], [3, 7], [3, 3]])
+        np.testing.assert_array_equal(
+            _majority_vote(predictions, np.asarray([3, 7]), random_state=0),
+            np.asarray([3, 3]),
         )
 
 
