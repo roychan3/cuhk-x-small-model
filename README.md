@@ -125,8 +125,7 @@ This repository includes a Streamlit dashboard with:
 - synchronized Depth Color, IR, and Thermal frames with play, pause, restart,
   speed, and manual scrubbing controls;
 - animated 3D skeletons, IMU magnitude traces, and radar point clouds;
-- predicted test actions loaded from any `path,prediction` submission CSV,
-  including an all-clip distribution/table and labels while clips play;
+- **Generate predictions** directly from any saved `artifacts/*/model.joblib` for **both training and test splits** with a live progress bar (`Extracting training features: X/2,785 → Extracting test features: X/405`), plus `path,prediction` CSV upload/auto-discovery; training predictions are visualized via accuracy, true-vs-predicted confusion matrix, predicted/true distributions and per-clip ✓/✗, test predictions via coverage/distribution/table; `Clip explorer` shows predicted vs true with correctness filters;
 - missing-modality, empty-sensor, and timestamp-alignment diagnostics;
 - **Algorithm comparison** page comparing every `artifacts/*/validation.json` (leaderboard, bar chart, confusion matrix + Δ recall, folds, metadata) — same source as `python -m modeling.compare`, and its CSV download is byte-identical to that command's output.
 
@@ -141,9 +140,7 @@ CUHKX_DATASET_ROOT=/path/to/small-model streamlit run visualization/app.py
 
 After `modeling.train` or `modeling.predict` creates a `*_submission.csv` under
 `outputs/`, the dashboard automatically selects the newest one. The sidebar also accepts
-another CSV path or a direct upload. In `Clip explorer`, test clips show the
-predicted action ID and name in both the selector and a banner above playback;
-`Overview` shows prediction coverage, class distribution, and a per-clip table.
+another CSV path or a direct upload. **Or generate predictions without leaving the UI:** in the sidebar **Generate predictions**, pick a saved `artifacts/*/model.joblib` (from `python -m modeling.train --algorithm <name>`), choose `Both (train + test)` / `Train only` / `Test only`, and click **Generate predictions** — a progress bar tracks `Extracting training features: X/2,785` and `Extracting test features: X/405` (via `modeling.features.extract_feature_bundle(progress_callback=…)` → `visualization.predictions.generate_*`), then the model’s predictions are attached to both splits. In `Clip explorer`, training clips show `true · pred · ✓/✗` with predicted-action and correctness filters, test clips show predicted labels; `Overview` shows a training confusion matrix (true vs predicted), accuracy/correct-vs-incorrect, predicted/true distributions, and per-clip tables for both splits, each downloadable as CSV.
 
 ### Dataset root
 
@@ -273,18 +270,19 @@ Run it from the repository root:
 python3 -m unittest discover -s tests -t .
 ```
 
-There are five suites with different requirements:
+There are six suites with different requirements:
 
 | Suite | Tests | Requires | Behavior without the requirement |
 |-------|-------|----------|----------------------------------|
 | `tests/test_visualization_dataset.py` | 15 | standard library only | always runs |
 | `tests/test_predictions.py` | 7 | standard library only | always runs |
 | `tests/test_comparison_format.py` | 13 | standard library only | always runs; its 2 CLI-parity tests skip without `modeling/requirements.txt` |
+| `tests/test_model_predictions.py` | 23 | artifact discovery and CSV round-tripping need the standard library only; the rest need `numpy`, `visualization/requirements.txt` (for `visualization.app`), or `modeling/requirements.txt` | 5 tests always run; the other 18 skip. Dataset I/O is mocked throughout, so no suite needs the dataset |
 | `tests/test_algorithm_comparison.py` | 16 | `visualization/requirements.txt` + `numpy` (for confusion-matrix math) | collapses to 1 skip |
 | `tests/test_modeling.py` | 21 | `modeling/requirements.txt` | collapses to 1 skip |
 
-So a bare interpreter reports `Ran 37 tests ... OK (skipped=4)`, while an
-interpreter with `visualization` + `modeling` deps reports `Ran 72 tests ... OK`
+So a bare interpreter reports `Ran 60 tests ... OK (skipped=22)`, while an
+interpreter with `visualization` + `modeling` deps reports `Ran 95 tests ... OK`
 (`skipped=1` when the optional real validation artifact is absent). A skip is
 expected, not a failure. Install the extras to run
 everything:

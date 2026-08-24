@@ -8,7 +8,7 @@ dataset and comparing training algorithms.
 - `app.py`: Streamlit application — Overview, Clip explorer, Data quality, and Algorithm comparison pages.
 - `algorithm_comparison.py`: Algorithm comparison page (reads `artifacts/*/validation.json` from `modeling.train`/`modeling.compare`; no `scikit-learn` needed).
 - `comparison_format.py`: standard-library-only definition of the comparison table (columns, row builder, run labels), shared with `modeling/compare.py` so the page and the CLI cannot drift.
-- `predictions.py`: standard-library prediction CSV validation, clip-ID normalization, and action-name mapping.
+- `predictions.py`: standard-library prediction CSV validation, clip-ID normalization, action-name mapping, plus `discover_model_artifacts`, `generate_predictions_from_model`, `generate_all_split_predictions` and `save_prediction_csv` for in-UI model inference on both train/test splits with an optional `progress_callback`.
 - `playback.py`: synchronized timeline and playback timing helpers.
 - `dataset.py`: standard-library dataset discovery, indexing, quality checks, archive access, and manifest generation.
 - `build_manifest.py`: command-line manifest generator.
@@ -25,20 +25,62 @@ pip install -r visualization/requirements.txt
 CUHKX_DATASET_ROOT=/path/to/small-model streamlit run visualization/app.py
 ```
 
-### Test prediction visualization
+### Generate predictions and visualize train + test
 
-The dashboard reads the same `path,prediction` CSV produced by
+Generate predictions **without leaving the dashboard**:
+
+1. Train a model once: `python -m modeling.train --algorithm logistic_regression --dataset-root /path/to/small-model --n-jobs 8` (writes `artifacts/logreg/model.joblib` and `outputs/logreg_submission.csv`).
+2. In the Streamlit sidebar **Generate predictions**, pick a saved `artifacts/*/model.joblib`, choose `Both (train + test)` / `Train only` / `Test only`, and click **Generate predictions**.
+3. A live progress bar tracks extraction per-clip (`Extracting training features: 1,250/2,785` → `Extracting test features: 200/405`, powered by `modeling.features.extract_feature_bundle(progress_callback=…)` → `visualization.predictions.generate_*`), then shows `Generated 3,190 predictions — complete!`. `Both` splits the bar into `train 5→70%` and `test 70→95%` so the ~2 min train extraction and ~20 s test extraction are visible, not a static spinner.
+
+The dashboard also still reads any `path,prediction` CSV produced by
 `python -m modeling.train` and `python -m modeling.predict`. It automatically
 selects the newest `*_submission.csv` under `outputs/`; use `Predictions CSV`
-in the sidebar to choose another path, or upload a CSV directly.
+in the sidebar to choose another path, or upload a CSV directly (CSV and
+model-generated predictions are merged, with the model taking precedence on
+conflicts, and both are downloadable as `generated_test_predictions.csv` /
+`generated_train_predictions.csv`).
 
-For test data, `Clip explorer` adds a predicted-action filter, includes the
+For **training** data (where ground truth exists), `Overview → Model predictions` adds training accuracy, correct vs incorrect counts, a true-vs-predicted confusion matrix (true rows, predicted columns), side-by-side predicted/true class distributions, and a per-clip table with `true_action → predicted_action → ✓/✗` (downloadable). `Clip explorer → Train` shows `true · pred · ✓/✗` in the clip selector, with predicted-action and correctness (`Correct only` / `Incorrect only`) filters, and a banner `Predicted: 02 · Drink_water — correct/incorrect (true: …) ✓/✗`.
+
+For **test** data, `Clip explorer` adds a predicted-action filter, includes the
 action ID/name beside every clip ID, and keeps the selected prediction visible
 above synchronized playback. `Overview` adds prediction coverage, a class
 distribution chart, and a table of every indexed test clip and its prediction.
 Blank prediction rows are ignored and reported; duplicate clips, non-integer
 IDs, unknown action IDs, and malformed headers are rejected with a sidebar
 error instead of being silently displayed.
+
+Programmatic use (no UI) is also supported:
+
+```python
+from visualization.predictions import generate_all_split_predictions, discover_model_artifacts
+
+models = discover_model_artifacts(".")  # newest first: artifacts/*/model.joblib
+tables = generate_all_split_predictions(
+    models[0], dataset_root="/path/to/small-model", n_jobs=4,
+    # done/total is a monotonic 0-100 percentage spanning both splits here
+    progress_callback=lambda done, total, message: print(f"{done}/{total} {message}")
+)
+# tables["train"].by_clip["0_Wash_face/user1/1-1-1"].action_id  → predicted id
+# tables["test"].by_clip["SM_test_0001"].action_name  → predicted name
+```
+
+And for a single split with progress:
+
+```python
+from visualization.predictions import generate_predictions_from_model
+table = generate_predictions_from_model(
+    "artifacts/logreg/model.joblib", split="train", n_jobs=4,
+    # done/total is a raw clip count for the single split being extracted
+    progress_callback=lambda done, total, message: print(f"{done}/{total} {message}")
+)
+```
+
+Both helpers take the same `progress_callback(done, total, message)` signature;
+only the scale of `done`/`total` differs, as noted above. Exceptions raised by
+the callback propagate, so a wrong-arity callback fails immediately instead of
+leaving a progress bar that silently never moves.
 
 Build a reusable manifest (strongly recommended — makes Overview/Clip explorer/Data quality load in ~0.2 s instead of scanning the full dataset and running `deep_test` JSON checks):
 

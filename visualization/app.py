@@ -11,6 +11,7 @@ import subprocess
 import sys
 from collections import Counter
 from pathlib import Path, PurePosixPath
+from typing import Callable, Mapping
 
 # Streamlit adds this script's directory to sys.path, but not necessarily the
 # repository root when launched by absolute path or from another directory.
@@ -39,11 +40,16 @@ from visualization.dataset import (
 )
 from visualization.playback import normalized_timeline_position, playback_interval, timeline_frame_count
 from visualization.predictions import (
+    ClipPrediction,
     PredictionTable,
+    discover_model_artifacts,
     discover_prediction_csvs,
+    generate_all_split_predictions,
+    generate_predictions_from_model,
     load_action_mapping,
     load_prediction_csv,
     parse_prediction_csv,
+    prediction_csv_text,
 )
 
 
@@ -87,6 +93,19 @@ def pretty_action(value: object) -> str:
 
 def prediction_label(action_id: object, action_name: object) -> str:
     return f"{int(action_id):02d} · {pretty_action(action_name)}"
+
+
+def correctness_flag(value: object) -> bool | None:
+    """Normalize a ``prediction_correct`` cell to ``True``/``False``/``None``.
+
+    The column uses pandas' nullable ``boolean`` dtype, so scalar access yields
+    ``numpy.bool_`` rather than ``bool``. Identity checks (``value is True``)
+    therefore never match; convert explicitly instead.
+    """
+
+    if value is None or pd.isna(value):
+        return None
+    return bool(value)
 
 
 def source_from_dict(data: dict[str, str]) -> DataSource:
@@ -249,17 +268,271 @@ def modality_coverage(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def add_predictions(frame: pd.DataFrame, predictions: PredictionTable) -> pd.DataFrame:
-    """Attach validated prediction IDs and names to matching test clips."""
+    """Attach validated prediction IDs and names to matching clips.
+
+    Predictions are matched by ``clip_id`` regardless of split so that both
+    training and test predictions can be visualized. Training clip IDs look
+    like ``<action>/<user>/<trial>`` while test IDs are ``SM_test_XXXX``,
+    so a test-only CSV naturally leaves training rows as ``NA`` and a
+    model-generated table that contains both splits fills both.
+    """
 
     enriched = frame.copy()
     action_ids = {clip_id: item.action_id for clip_id, item in predictions.by_clip.items()}
     action_names = {clip_id: item.action_name for clip_id, item in predictions.by_clip.items()}
-    test_rows = enriched["split"] == "test"
-    enriched["prediction_action_id"] = (
-        enriched["clip_id"].map(action_ids).where(test_rows).astype("Int64")
-    )
-    enriched["prediction_action_name"] = enriched["clip_id"].map(action_names).where(test_rows)
+    enriched["prediction_action_id"] = enriched["clip_id"].map(action_ids).astype("Int64")
+    enriched["prediction_action_name"] = enriched["clip_id"].map(action_names)
+    # Convenience correctness flag for training clips (where ground truth exists).
+    if "action_id" in enriched.columns:
+        # Start as <NA> and fill only where a prediction exists; then mask test rows.
+        enriched["prediction_correct"] = pd.NA
+        has_pred = enriched["prediction_action_id"].notna() & enriched["action_id"].notna()
+        # Use nullable boolean dtype
+        enriched.loc[has_pred, "prediction_correct"] = (
+            enriched.loc[has_pred, "prediction_action_id"].astype("Int64")
+            == enriched.loc[has_pred, "action_id"].astype("Int64")
+        )
+        enriched["prediction_correct"] = enriched["prediction_correct"].astype("boolean")
+        enriched.loc[enriched["split"] == "test", "prediction_correct"] = pd.NA
     return enriched
+
+
+def add_split_predictions(
+    frame: pd.DataFrame,
+    predictions_by_split: Mapping[str, PredictionTable],
+) -> pd.DataFrame:
+    """Attach predictions from a ``{split: PredictionTable}`` mapping."""
+
+    enriched = frame.copy()
+    # Build unified maps, then delegate to ``add_predictions`` so the
+    # correctness logic stays in one place.
+    merged: dict[str, ClipPrediction] = {}
+    for table in predictions_by_split.values():
+        merged.update(table.by_clip)
+    combined = PredictionTable(
+        by_clip=merged,
+        rows_read=sum(t.rows_read for t in predictions_by_split.values()),
+        blank_predictions=sum(t.blank_predictions for t in predictions_by_split.values()),
+    )
+    return add_predictions(enriched, combined)
+
+
+def merge_prediction_sources(
+    generated: Mapping[str, PredictionTable],
+    csv_table: PredictionTable | None,
+) -> dict[str, PredictionTable]:
+    """Combine model-generated and CSV predictions into one attachable mapping.
+
+    Model-generated predictions win on overlapping clip IDs. The result must be
+    attached in a single ``add_split_predictions`` call: ``add_predictions``
+    reassigns the prediction columns wholesale, so attaching the two sources in
+    sequence would discard whichever was attached first.
+    """
+
+    merged = dict(generated)
+    if csv_table is None:
+        return merged
+    generated_ids = {clip_id for table in generated.values() for clip_id in table.by_clip}
+    csv_only = {
+        clip_id: prediction
+        for clip_id, prediction in csv_table.by_clip.items()
+        if clip_id not in generated_ids
+    }
+    if csv_only:
+        merged["csv"] = PredictionTable(
+            by_clip=csv_only, rows_read=len(csv_only), blank_predictions=0
+        )
+    return merged
+
+
+def _render_prediction_section(train: pd.DataFrame, test: pd.DataFrame) -> None:
+    """Render prediction visualizations for both training and test splits."""
+
+    has_train_preds = "prediction_action_id" in train.columns and not train.dropna(
+        subset=["prediction_action_id"]
+    ).empty
+    has_test_preds = "prediction_action_id" in test.columns and not test.dropna(subset=["prediction_action_id"]).empty
+
+    if not has_train_preds and not has_test_preds:
+        return
+
+    st.subheader("Model predictions")
+
+    if has_train_preds and has_test_preds:
+        train_pred = train.dropna(subset=["prediction_action_id"]).copy()
+        test_pred = test.dropna(subset=["prediction_action_id"]).copy()
+        cols = st.columns(4)
+        cols[0].metric("Train predicted", f"{len(train_pred):,} / {len(train):,}")
+        accuracy = float((train_pred["prediction_action_id"].astype(int) == train_pred["action_id"].astype(int)).mean()) if len(
+            train_pred
+        ) else 0.0
+        cols[1].metric("Train accuracy", f"{accuracy:.1%}")
+        cols[2].metric("Test predicted", f"{len(test_pred):,} / {len(test):,}")
+        cols[3].metric("Predicted actions (test)", int(test_pred["prediction_action_id"].nunique()))
+    elif has_test_preds:
+        predicted = test.dropna(subset=["prediction_action_id"]).copy()
+        prediction_metrics = st.columns(3)
+        prediction_metrics[0].metric("Predicted clips", f"{len(predicted):,}")
+        prediction_metrics[1].metric(
+            "Visible coverage",
+            f"{len(predicted) / len(test):.1%}" if len(test) else "—",
+        )
+        prediction_metrics[2].metric(
+            "Predicted actions",
+            int(predicted["prediction_action_id"].nunique()),
+        )
+    elif has_train_preds:
+        train_pred = train.dropna(subset=["prediction_action_id"]).copy()
+        cols = st.columns(3)
+        cols[0].metric("Predicted training clips", f"{len(train_pred):,} / {len(train):,}")
+        accuracy = float((train_pred["prediction_action_id"].astype(int) == train_pred["action_id"].astype(int)).mean()) if len(
+            train_pred
+        ) else 0.0
+        cols[1].metric("Training accuracy", f"{accuracy:.1%}")
+        cols[2].metric("Predicted actions", int(train_pred["prediction_action_id"].nunique()))
+
+    # Training-specific visualizations
+    if has_train_preds:
+        train_pred = train.dropna(subset=["prediction_action_id"]).copy()
+        # Accuracy and correctness breakdown
+        correct = (train_pred["prediction_action_id"].astype(int) == train_pred["action_id"].astype(int)).sum()
+        incorrect = len(train_pred) - int(correct)
+        st.markdown("**Training predictions — correctness**")
+        c1, c2 = st.columns(2)
+        with c1:
+            acc = float(correct / len(train_pred)) if len(train_pred) else 0.0
+            st.metric("Correct", f"{int(correct):,} ({acc:.1%})")
+        with c2:
+            st.metric("Incorrect", f"{int(incorrect):,}")
+
+        # Confusion-matrix style heatmap: true vs predicted
+        try:
+            true_ids = train_pred["action_id"].astype(int)
+            pred_ids = train_pred["prediction_action_id"].astype(int)
+            all_ids = sorted(set(true_ids) | set(pred_ids))
+            # Build confusion matrix manually to avoid sklearn dependency if missing.
+            import numpy as np
+
+            id_to_pos = {aid: i for i, aid in enumerate(all_ids)}
+            matrix = np.zeros((len(all_ids), len(all_ids)), dtype=int)
+            for t, p in zip(true_ids, pred_ids, strict=True):
+                matrix[id_to_pos[int(t)], id_to_pos[int(p)]] += 1
+            # Labels for display; one pass over the frame instead of a filter per class.
+            name_by_id = dict(zip(true_ids, train_pred["action_name"], strict=True))
+            labels = [pretty_action(name_by_id[aid]) if aid in name_by_id else str(aid) for aid in all_ids]
+            fig = go.Figure(
+                data=go.Heatmap(
+                    z=matrix,
+                    x=labels,
+                    y=labels,
+                    colorscale="Blues",
+                    colorbar_title="count",
+                    hovertemplate="true=%{y}<br>pred=%{x}<br>count=%{z}<extra></extra>",
+                )
+            )
+            fig.update_layout(
+                title="Training confusion matrix (true vs predicted)",
+                xaxis_title="Predicted",
+                yaxis_title="True",
+                height=520,
+                xaxis={"tickangle": -45},
+                yaxis={"autorange": "reversed"},
+            )
+            st.plotly_chart(fig, width="stretch")
+            st.caption("Rows = true action, columns = predicted. Only training clips with a prediction are shown.")
+        except Exception as exc:
+            st.warning(f"Could not render the training confusion matrix: {exc}")
+
+        # Distribution of predicted vs true for training
+        pred_dist = (
+            train_pred.groupby(["prediction_action_id", "prediction_action_name"], dropna=False)
+            .size()
+            .reset_index(name="clips")
+            .sort_values("prediction_action_id")
+        )
+        pred_dist["action"] = pred_dist.apply(
+            lambda row: prediction_label(row["prediction_action_id"], row["prediction_action_name"]),
+            axis=1,
+        )
+        true_dist = (
+            train_pred.groupby(["action_id", "action_name"], dropna=False)
+            .size()
+            .reset_index(name="clips")
+            .sort_values("action_id")
+        )
+        true_dist["action"] = true_dist["action_name"].map(pretty_action)
+        # Side-by-side bar comparison
+        c1, c2 = st.columns(2)
+        with c1:
+            fig = px.bar(pred_dist, x="action", y="clips", color="clips", color_continuous_scale="Teal", title="Predicted distribution (train)")
+            fig.update_layout(xaxis_tickangle=-55, coloraxis_showscale=False, height=430)
+            st.plotly_chart(fig, width="stretch")
+        with c2:
+            fig = px.bar(true_dist, x="action", y="clips", color="clips", color_continuous_scale="Blues", title="True distribution (train)")
+            fig.update_layout(xaxis_tickangle=-55, coloraxis_showscale=False, height=430)
+            st.plotly_chart(fig, width="stretch")
+
+        with st.expander("Predictions by training clip"):
+            prediction_rows = train[["clip_id", "action_id", "action_name", "prediction_action_id", "prediction_action_name"]].copy()
+            prediction_rows = prediction_rows.sort_values("clip_id")
+            prediction_rows["true_action"] = prediction_rows.apply(
+                lambda row: prediction_label(row["action_id"], row["action_name"]) if pd.notna(row["action_id"]) else "Unknown",
+                axis=1,
+            )
+            prediction_rows["predicted_action"] = prediction_rows.apply(
+                lambda row: prediction_label(row["prediction_action_id"], row["prediction_action_name"]) if pd.notna(row["prediction_action_id"]) else "No prediction",
+                axis=1,
+            )
+            prediction_rows["correct"] = prediction_rows.apply(
+                lambda row: "✓" if pd.notna(row["prediction_action_id"]) and row["prediction_action_id"] == row["action_id"] else ("✗" if pd.notna(row["prediction_action_id"]) else "—"),
+                axis=1,
+            )
+            st.dataframe(
+                prediction_rows[["clip_id", "true_action", "predicted_action", "correct"]],
+                hide_index=True,
+                width="stretch",
+            )
+
+    if has_test_preds:
+        predicted = test.dropna(subset=["prediction_action_id"]).copy()
+        distribution = (
+            predicted.groupby(["prediction_action_id", "prediction_action_name"], dropna=False)
+            .size()
+            .reset_index(name="clips")
+            .sort_values("prediction_action_id")
+        )
+        distribution["action"] = distribution.apply(
+            lambda row: prediction_label(row["prediction_action_id"], row["prediction_action_name"]),
+            axis=1,
+        )
+        st.markdown("**Test predictions — distribution**")
+        figure = px.bar(
+            distribution,
+            x="action",
+            y="clips",
+            color="clips",
+            color_continuous_scale="Teal",
+        )
+        figure.update_layout(xaxis_tickangle=-55, coloraxis_showscale=False, height=430)
+        st.plotly_chart(figure, width="stretch")
+
+        with st.expander("Predictions by test clip"):
+            prediction_rows = test[["clip_id", "prediction_action_id", "prediction_action_name"]].sort_values("clip_id")
+            prediction_rows = prediction_rows.rename(
+                columns={
+                    "prediction_action_id": "action_id",
+                    "prediction_action_name": "action_name",
+                }
+            )
+            prediction_rows["action"] = prediction_rows.apply(
+                lambda row: prediction_label(row["action_id"], row["action_name"]) if pd.notna(row["action_id"]) else "No prediction",
+                axis=1,
+            )
+            st.dataframe(
+                prediction_rows[["clip_id", "action_id", "action"]],
+                hide_index=True,
+                width="stretch",
+            )
 
 
 def render_overview(frame: pd.DataFrame) -> None:
@@ -274,66 +547,7 @@ def render_overview(frame: pd.DataFrame) -> None:
     metric_columns[3].metric("Users", int(train["user"].nunique()) if not train.empty else 0)
     metric_columns[4].metric("All modalities", f"{complete / len(frame):.1%}" if len(frame) else "—")
 
-    if "prediction_action_id" in test.columns:
-        predicted = test.dropna(subset=["prediction_action_id"]).copy()
-        if not predicted.empty:
-            st.subheader("Test predictions")
-            prediction_metrics = st.columns(3)
-            prediction_metrics[0].metric("Predicted clips", f"{len(predicted):,}")
-            prediction_metrics[1].metric(
-                "Visible coverage",
-                f"{len(predicted) / len(test):.1%}" if len(test) else "—",
-            )
-            prediction_metrics[2].metric(
-                "Predicted actions",
-                int(predicted["prediction_action_id"].nunique()),
-            )
-
-            distribution = (
-                predicted.groupby(["prediction_action_id", "prediction_action_name"], dropna=False)
-                .size()
-                .reset_index(name="clips")
-                .sort_values("prediction_action_id")
-            )
-            distribution["action"] = distribution.apply(
-                lambda row: prediction_label(
-                    row["prediction_action_id"], row["prediction_action_name"]
-                ),
-                axis=1,
-            )
-            figure = px.bar(
-                distribution,
-                x="action",
-                y="clips",
-                color="clips",
-                color_continuous_scale="Teal",
-            )
-            figure.update_layout(xaxis_tickangle=-55, coloraxis_showscale=False, height=430)
-            st.plotly_chart(figure, width="stretch")
-
-            with st.expander("Predictions by test clip"):
-                prediction_rows = test[
-                    ["clip_id", "prediction_action_id", "prediction_action_name"]
-                ].sort_values("clip_id")
-                prediction_rows = prediction_rows.rename(
-                    columns={
-                        "prediction_action_id": "action_id",
-                        "prediction_action_name": "action_name",
-                    }
-                )
-                prediction_rows["action"] = prediction_rows.apply(
-                    lambda row: (
-                        prediction_label(row["action_id"], row["action_name"])
-                        if pd.notna(row["action_id"])
-                        else "No prediction"
-                    ),
-                    axis=1,
-                )
-                st.dataframe(
-                    prediction_rows[["clip_id", "action_id", "action"]],
-                    hide_index=True,
-                    width="stretch",
-                )
+    _render_prediction_section(train, test)
 
     left, right = st.columns((1.45, 1))
     with left:
@@ -637,6 +851,10 @@ def render_clip_explorer(frame: pd.DataFrame, sources: dict[str, dict[str, str]]
     split = st.selectbox("Split", splits)
     filtered = frame[frame["split"] == split].copy()
 
+    has_predictions = "prediction_action_id" in filtered.columns and not filtered.dropna(
+        subset=["prediction_action_id"]
+    ).empty
+
     if split == "train" and not filtered.empty:
         actions = (
             filtered[["action_id", "action_name"]]
@@ -653,7 +871,35 @@ def render_clip_explorer(frame: pd.DataFrame, sources: dict[str, dict[str, str]]
         users = sorted(filtered["user"].dropna().unique(), key=natural_key)
         user = st.selectbox("User", users)
         filtered = filtered[filtered["user"] == user]
-    elif split == "test" and "prediction_action_id" in filtered.columns:
+
+        if has_predictions:
+            # After narrowing to action/user, offer predicted-action and correctness filters.
+            pred_filtered = filtered.dropna(subset=["prediction_action_id"])
+            if not pred_filtered.empty:
+                prediction_options = {
+                    prediction_label(action_id, group["prediction_action_name"].iloc[0]): int(action_id)
+                    for action_id, group in pred_filtered.groupby("prediction_action_id")
+                }
+                selected_prediction = st.selectbox(
+                    "Predicted action (train)",
+                    ["All training clips", *prediction_options],
+                    key="train_predicted_action",
+                )
+                if selected_prediction != "All training clips":
+                    filtered = filtered[
+                        filtered["prediction_action_id"].fillna(-1).astype(int)
+                        == prediction_options[selected_prediction]
+                    ]
+                correctness = st.selectbox(
+                    "Correctness",
+                    ["All", "Correct only", "Incorrect only"],
+                    key="train_correctness",
+                )
+                if correctness == "Correct only":
+                    filtered = filtered[filtered["prediction_correct"] == True]  # noqa: E712
+                elif correctness == "Incorrect only":
+                    filtered = filtered[filtered["prediction_correct"] == False]  # noqa: E712
+    elif split == "test" and has_predictions:
         predicted = filtered.dropna(subset=["prediction_action_id"])
         if not predicted.empty:
             prediction_options = {
@@ -676,28 +922,41 @@ def render_clip_explorer(frame: pd.DataFrame, sources: dict[str, dict[str, str]]
         return
 
     def clip_label(clip_id: str) -> str:
-        if split != "test" or "prediction_action_id" not in filtered.columns:
+        if "prediction_action_id" not in filtered.columns:
             return clip_id
         matches = filtered[filtered["clip_id"] == clip_id]
         if matches.empty or pd.isna(matches.iloc[0].get("prediction_action_id")):
             return f"{clip_id} · no prediction"
         item = matches.iloc[0]
-        return (
-            f"{clip_id} · "
-            f"{prediction_label(item['prediction_action_id'], item['prediction_action_name'])}"
-        )
+        pred_label = prediction_label(item["prediction_action_id"], item["prediction_action_name"])
+        if split == "train":
+            true_label = prediction_label(item["action_id"], item["action_name"])
+            correct = correctness_flag(item.get("prediction_correct"))
+            mark = "✓" if correct else ("✗" if correct is False else "")
+            return f"{clip_id} · true {true_label} · pred {pred_label} {mark}".strip()
+        return f"{clip_id} · {pred_label}"
 
     clip_id = st.selectbox("Clip", clip_ids, format_func=clip_label)
     row = filtered[filtered["clip_id"] == clip_id].iloc[0]
 
-    if split == "test" and "prediction_action_id" in row.index:
-        if pd.notna(row.get("prediction_action_id")):
+    if "prediction_action_id" in row.index and pd.notna(row.get("prediction_action_id")):
+        if split == "train":
+            true_label = prediction_label(row["action_id"], row["action_name"])
+            pred_label = prediction_label(row["prediction_action_id"], row["prediction_action_name"])
+            correct = correctness_flag(row.get("prediction_correct"))
+            if correct:
+                st.success(f"Predicted: {pred_label} — correct (true: {true_label}) ✓")
+            elif correct is False:
+                st.error(f"Predicted: {pred_label} — incorrect (true: {true_label}) ✗")
+            else:
+                st.info(f"Predicted: {pred_label} (true: {true_label})")
+        else:
             st.success(
                 "Predicted action: "
                 f"{prediction_label(row['prediction_action_id'], row['prediction_action_name'])}"
             )
-        else:
-            st.warning("This test clip has no prediction in the selected CSV.")
+    elif "prediction_action_id" in row.index:
+        st.warning("This clip has no prediction in the selected source.")
 
     counts = st.columns(6)
     for column, modality in zip(counts, MODALITIES):
@@ -1033,6 +1292,65 @@ def main() -> None:
             type=("csv",),
             help="An uploaded file overrides the path above for this session.",
         )
+
+        st.subheader("Generate predictions")
+        st.caption("Run a saved model to generate predictions for training and test clips.")
+        model_artifacts = discover_model_artifacts(repository_root)
+        if model_artifacts:
+            artifact_options = [str(path) for path in model_artifacts]
+            # Default to the newest artifact.
+            default_artifact = artifact_options[0] if artifact_options else ""
+            if "model_artifact_input" not in st.session_state:
+                st.session_state["model_artifact_input"] = default_artifact
+            selected_model = st.selectbox(
+                "Model artifact",
+                artifact_options,
+                key="model_artifact_input",
+                help="Artifacts from `python -m modeling.train --algorithm <name>` (artifacts/*/model.joblib).",
+            )
+            split_choice = st.selectbox(
+                "Split to predict",
+                ["Both (train + test)", "Train only", "Test only"],
+                key="model_split_choice",
+                help="Generate predictions for the selected split(s). 'Both' enables Overview and Clip explorer visualizations for training and test.",
+            )
+            n_jobs_model = st.number_input(
+                "Parallel jobs",
+                min_value=1,
+                max_value=32,
+                value=4,
+                step=1,
+                key="model_n_jobs",
+                help="Parallelism for feature extraction.",
+            )
+            col_gen, col_clear = st.columns(2)
+            with col_gen:
+                generate_clicked = st.button(
+                    "Generate predictions",
+                    key="generate_model_predictions",
+                    help="Extract features and run the selected model. Uses the current Dataset root.",
+                    width="stretch",
+                )
+            with col_clear:
+                if st.button("Clear generated", key="clear_generated_predictions", width="stretch"):
+                    for key in ("generated_model_predictions", "generated_model_source", "generated_model_split"):
+                        st.session_state.pop(key, None)
+                    st.cache_data.clear()
+                    st.rerun()
+            if generate_clicked:
+                # Store request; actual generation happens after dataset manifest is loaded
+                # so that dataset_root and mapping resolution are consistent.
+                st.session_state["generate_requested"] = {
+                    "model_path": selected_model,
+                    "split_choice": split_choice,
+                    "n_jobs": int(n_jobs_model),
+                    "dataset_root": dataset_root,
+                }
+                st.rerun()
+        else:
+            st.caption("No saved models found at `artifacts/*/model.joblib`. Train one with `python -m modeling.train --algorithm logistic_regression`.")
+            generate_clicked = False
+
         if st.button("Clear cached index", key="clear_cache_main"):
             st.cache_data.clear()
             # Also drops a finished or failed background builder, so this is the
@@ -1076,6 +1394,9 @@ def main() -> None:
 
     frame = pd.DataFrame(records)
 
+    # ------------------------------------------------------------------
+    # CSV-based predictions (test and optionally train)
+    # ------------------------------------------------------------------
     prediction_table: PredictionTable | None = None
     prediction_source = ""
     if prediction_csv or uploaded_prediction is not None:
@@ -1111,21 +1432,197 @@ def main() -> None:
                     mapping_items,
                 )
                 prediction_source = str(prediction_path)
-            frame = add_predictions(frame, prediction_table)
+            # Defer attaching until after model generation decision so we can merge.
         except Exception as exc:
             st.sidebar.error(f"Could not load predictions: {exc}")
+            prediction_table = None
+            prediction_source = ""
 
-    if prediction_table is not None:
-        visible_test_ids = set(frame.loc[frame["split"] == "test", "clip_id"].astype(str))
-        visible_predictions = len(visible_test_ids & set(prediction_table.by_clip))
-        st.sidebar.caption(
-            f"Loaded {len(prediction_table.by_clip):,} predictions from {prediction_source}. "
-            f"Matched {visible_predictions:,}/{len(visible_test_ids):,} visible test clips."
+    # ------------------------------------------------------------------
+    # Model-generated predictions (for training and test)
+    # ------------------------------------------------------------------
+    # If the user requested generation via the sidebar button, run it now.
+    # This is done after the manifest is loaded so that dataset_root is
+    # validated and the action mapping can be resolved consistently.
+    generated_predictions: dict[str, PredictionTable] | None = None
+    generated_source = ""
+    if st.session_state.get("generate_requested") is not None:
+        request = st.session_state.pop("generate_requested")
+        model_path_req = Path(request["model_path"]).expanduser()
+        split_choice_req = request.get("split_choice", "Both (train + test)")
+        n_jobs_req = int(request.get("n_jobs", 4))
+        # Dataset root at generation time may differ from current sidebar value;
+        # use the requested root for reproducibility.
+        dataset_root_req = str(request.get("dataset_root", str(root)))
+        mapping_candidates_gen = (
+            repository_root / "Training" / "class_mapping.csv",
+            Path(dataset_root_req).expanduser() / "Training" / "class_mapping.csv",
         )
-        if prediction_table.blank_predictions:
-            st.sidebar.warning(
-                f"Ignored {prediction_table.blank_predictions:,} row(s) with blank predictions."
+        mapping_path_gen = next((p for p in mapping_candidates_gen if p.is_file()), None)
+        try:
+            if mapping_path_gen is None:
+                raise FileNotFoundError(
+                    "Training/class_mapping.csv not found in repository or dataset root"
+                )
+            mapping_stat_gen = mapping_path_gen.stat()
+            action_mapping_gen = cached_action_mapping(
+                str(mapping_path_gen), mapping_stat_gen.st_mtime_ns, mapping_stat_gen.st_size
             )
+            mapping_items_gen = tuple(sorted(action_mapping_gen.items()))
+
+            # Progress bar replaces the previous spinner so the user sees
+            # per-clip extraction progress instead of a static message.
+            progress_bar = st.progress(0, text=f"Generating predictions with {model_path_req.name} — preparing…")
+            # ``st.progress`` is thread-safe when called from the main thread,
+            # which is where ``extract_feature_bundle`` invokes the callback as
+            # it yields results from the ProcessPoolExecutor.
+            def set_progress(percent: int, message: str) -> None:
+                progress_bar.progress(max(0, min(100, int(percent))), text=message)
+
+            def rescale(start: int, span: int) -> Callable[[int, int, str], None]:
+                """Map one split's raw clip counts onto ``start..start+span``."""
+
+                def forward(done: int, total: int, message: str) -> None:
+                    set_progress(start + int(span * done / max(1, total)), message)
+
+                return forward
+
+            def percent_progress(current: int, total: int, message: str) -> None:
+                # ``generate_all_split_predictions`` already reports a monotonic
+                # 0-100 percentage spanning both splits, so pass it straight through.
+                del total
+                set_progress(current, message)
+
+            # Generation runs uncached so the callback can drive the bar during the
+            # ~2 min train extraction (2,785 clips) and ~20 s test extraction (405
+            # clips). The result is persisted in ``st.session_state`` below, which is
+            # what serves subsequent reruns.
+            try:
+                set_progress(2, "Loading model and class mapping…")
+                if split_choice_req in {"Train only", "Test only"}:
+                    only_split = "train" if split_choice_req == "Train only" else "test"
+                    table = generate_predictions_from_model(
+                        str(model_path_req),
+                        dataset_root_req,
+                        None,
+                        dict(mapping_items_gen),
+                        split=only_split,
+                        n_jobs=n_jobs_req,
+                        progress_callback=rescale(5, 90),
+                    )
+                    generated_predictions = {only_split: table}
+                else:
+                    generated_predictions = generate_all_split_predictions(
+                        str(model_path_req),
+                        dataset_root_req,
+                        None,
+                        dict(mapping_items_gen),
+                        n_jobs=n_jobs_req,
+                        progress_callback=percent_progress,
+                    )
+                set_progress(
+                    100,
+                    f"Generated {sum(len(t.by_clip) for t in generated_predictions.values()):,} "
+                    "predictions — complete!",
+                )
+            finally:
+                progress_bar.empty()
+            generated_source = str(model_path_req)
+            # Persist for subsequent reruns (filters, page switches) until cleared.
+            st.session_state["generated_model_predictions"] = generated_predictions
+            st.session_state["generated_model_source"] = generated_source
+            st.session_state["generated_model_split"] = split_choice_req
+            st.success(f"Generated {sum(len(t.by_clip) for t in generated_predictions.values()):,} predictions from {model_path_req.name}")
+        except Exception as exc:
+            st.sidebar.error(f"Could not generate predictions: {exc}")
+            st.error(f"Could not generate predictions: {exc}")
+
+    # Rehydrate previously generated predictions on normal reruns.
+    if generated_predictions is None and "generated_model_predictions" in st.session_state:
+        generated_predictions = st.session_state["generated_model_predictions"]
+        generated_source = st.session_state.get("generated_model_source", "")
+
+    # ------------------------------------------------------------------
+    # Attach predictions to the frame (CSV and/or model-generated)
+    # ------------------------------------------------------------------
+    # Model-generated predictions take precedence over CSV for overlapping IDs.
+    if generated_predictions is not None:
+        # Attach the generated predictions and any non-conflicting CSV entries in a
+        # single pass — see ``merge_prediction_sources``.
+        frame = add_split_predictions(
+            frame, merge_prediction_sources(generated_predictions, prediction_table)
+        )
+        # Report generated predictions
+        total_generated = sum(len(t.by_clip) for t in generated_predictions.values())
+        train_gen = len(generated_predictions.get("train", PredictionTable({}, 0, 0)).by_clip)
+        test_gen = len(generated_predictions.get("test", PredictionTable({}, 0, 0)).by_clip)
+        st.sidebar.caption(
+            f"Generated {total_generated:,} predictions from model {generated_source} "
+            f"(train: {train_gen:,}, test: {test_gen:,}). Matched {train_gen:,} training and {test_gen:,} test clips in current view."
+        )
+        # Keep rendering helpers aware of generated source for download etc.
+        # For downstream reporting, keep prediction_table pointing to the test split if present.
+        if prediction_table is None:
+            prediction_table = generated_predictions.get("test") or next(iter(generated_predictions.values()))
+            prediction_source = generated_source
+        # Provide download for generated test predictions if present.
+        if "test" in generated_predictions:
+            st.sidebar.download_button(
+                "Download generated test CSV",
+                data=prediction_csv_text(generated_predictions["test"]),
+                file_name="generated_test_predictions.csv",
+                mime="text/csv",
+                key="download_generated_test_csv",
+            )
+        if "train" in generated_predictions:
+            csv_train = io.StringIO()
+            writer = csv.DictWriter(csv_train, fieldnames=("clip_id", "true_action_id", "prediction", "predicted_action_name"))
+            writer.writeheader()
+            train_frame = frame[frame["split"] == "train"]
+            for clip_id, pred in generated_predictions["train"].by_clip.items():
+                true_row = train_frame[train_frame["clip_id"] == clip_id]
+                true_id = int(true_row["action_id"].iloc[0]) if not true_row.empty and pd.notna(true_row["action_id"].iloc[0]) else ""
+                writer.writerow(
+                    {
+                        "clip_id": clip_id,
+                        "true_action_id": true_id,
+                        "prediction": int(pred.action_id),
+                        "predicted_action_name": pred.action_name,
+                    }
+                )
+            st.sidebar.download_button(
+                "Download generated train CSV",
+                data=csv_train.getvalue(),
+                file_name="generated_train_predictions.csv",
+                mime="text/csv",
+                key="download_generated_train_csv",
+            )
+    elif prediction_table is not None:
+        # Only CSV predictions — attach them (now supports both train and test IDs).
+        frame = add_predictions(frame, prediction_table)
+        # Report coverage per split for clarity.
+        train_visible = len(set(frame.loc[frame["split"] == "train", "clip_id"].astype(str)) & set(prediction_table.by_clip))
+        test_visible = len(set(frame.loc[frame["split"] == "test", "clip_id"].astype(str)) & set(prediction_table.by_clip))
+        if prediction_csv or uploaded_prediction is not None:
+            if train_visible and test_visible:
+                st.sidebar.caption(
+                    f"Loaded {len(prediction_table.by_clip):,} predictions from {prediction_source}. "
+                    f"Matched {train_visible:,} training and {test_visible:,} test clips in current view."
+                )
+            elif train_visible:
+                st.sidebar.caption(
+                    f"Loaded {len(prediction_table.by_clip):,} predictions from {prediction_source}. "
+                    f"Matched {train_visible:,} training clips."
+                )
+            else:
+                st.sidebar.caption(
+                    f"Loaded {len(prediction_table.by_clip):,} predictions from {prediction_source}. "
+                    f"Matched {test_visible:,}/{len(set(frame.loc[frame['split'] == 'test', 'clip_id'].astype(str))):,} visible test clips."
+                )
+            if prediction_table.blank_predictions:
+                st.sidebar.warning(
+                    f"Ignored {prediction_table.blank_predictions:,} row(s) with blank predictions."
+                )
     if partial_manifest and background_process is not None:
         render_background_manifest_status(
             background_process,

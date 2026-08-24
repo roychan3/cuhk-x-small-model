@@ -110,6 +110,16 @@ Feature extraction can be run by itself:
 python -m modeling.train --extract-only --n-jobs 8
 ```
 
+`modeling.features.extract_feature_bundle` now accepts an optional `progress_callback(done, total)` (called every `progress_every` clips, default 50) which the dashboard wires to a `st.progress` bar. The `visualization.predictions.generate_*` helpers expose a wider `progress_callback(done, total, message)` and adapt it to this two-argument form, so `Both (train + test)` maps setup to `0→5%`, train to `5→70%`, test to `70→95%` and finalization to `95→100%` — a single monotonic bar rather than a static spinner. Exceptions from the callback propagate.
+
+```python
+from modeling.features import FeatureConfig, extract_feature_bundle
+from modeling.data import discover_training_clips
+
+records, _ = discover_training_clips("/path/to/small-model")
+bundle = extract_feature_bundle(records, FeatureConfig(), n_jobs=4, progress_callback=lambda done, total: print(f"{done}/{total}"))
+```
+
 Generate predictions again from an existing model:
 
 ```bash

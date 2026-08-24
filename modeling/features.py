@@ -10,7 +10,7 @@ from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable, Iterator, Sequence
+from typing import Callable, Iterable, Iterator, Sequence
 
 import numpy as np
 from PIL import Image
@@ -1052,8 +1052,16 @@ def extract_feature_bundle(
     *,
     n_jobs: int = 1,
     progress_every: int = 50,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> RawFeatureBundle:
-    """Extract raw modality matrices while preserving record order."""
+    """Extract raw modality matrices while preserving record order.
+
+    When ``progress_callback`` is provided it is called as
+    ``progress_callback(done, total)`` each time ``progress_every`` clips
+    have been processed (and once at the end). Exceptions raised by the
+    callback propagate rather than being swallowed, so a wrong-arity callback
+    fails loudly instead of silently never updating.
+    """
 
     if not records:
         raise ValueError("Cannot extract features from an empty record list")
@@ -1090,6 +1098,8 @@ def extract_feature_bundle(
         skeleton_engineered.append(skeleton_engineered_value)
         if progress_every > 0 and (index % progress_every == 0 or index == len(records)):
             print(f"Extracted {index:,}/{len(records):,} clips", flush=True)
+        if progress_callback is not None and (index % progress_every == 0 or index == len(records)):
+            progress_callback(index, len(records))
 
     is_train = records[0].split == "train"
     return RawFeatureBundle(
