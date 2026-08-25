@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import csv
 import io
 import json
@@ -11,8 +12,9 @@ import statistics
 import subprocess
 import sys
 from collections import Counter
+from collections.abc import Callable, Iterable, Mapping
+from functools import lru_cache
 from pathlib import Path, PurePosixPath
-from typing import Callable, Iterable, Mapping
 
 # Streamlit adds this script's directory to sys.path, but not necessarily the
 # repository root when launched by absolute path or from another directory.
@@ -25,6 +27,8 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 import streamlit.components.v1 as components
+from PIL import Image
+from plotly.offline import get_plotlyjs
 from plotly.subplots import make_subplots
 
 from visualization.algorithm_comparison import render_algorithm_comparison
@@ -41,10 +45,9 @@ from visualization.dataset import (
     resolve_dataset_root,
 )
 from visualization.playback import (
-    normalized_timeline_position,
     playback_interval,
-    playback_start_frame,
     timeline_frame_count,
+    timeline_member_index,
 )
 from visualization.predictions import (
     ClipPrediction,
@@ -58,7 +61,6 @@ from visualization.predictions import (
     parse_prediction_csv,
     prediction_csv_text,
 )
-
 
 st.set_page_config(page_title="CUHK-X Dataset Explorer", page_icon="🧭", layout="wide")
 
@@ -332,13 +334,6 @@ def cached_uploaded_predictions(
     action_mapping: tuple[tuple[int, str], ...],
 ) -> PredictionTable:
     return parse_prediction_csv(contents.decode("utf-8-sig"), dict(action_mapping))
-
-
-def choose_member(paths: list[str], position: int) -> str | None:
-    if not paths:
-        return None
-    index = round((len(paths) - 1) * position / 100)
-    return paths[index]
 
 
 def modality_coverage(frame: pd.DataFrame) -> pd.DataFrame:
@@ -762,20 +757,6 @@ def _skeleton_axis_ranges_from_points(
     )
 
 
-def skeleton_axis_ranges(
-    payloads: Iterable[bytes],
-) -> SkeletonAxisRanges | None:
-    """Return one equal-scale axis cube covering every pose in a clip."""
-
-    points = [
-        point
-        for payload in payloads
-        for person_points, _ in _skeleton_people(payload)
-        for point in person_points
-    ]
-    return _skeleton_axis_ranges_from_points(points)
-
-
 def _stabilize_skeleton_points(
     points: list[tuple[float, float, float]],
     bone_lengths: SkeletonBoneLengths,
@@ -822,340 +803,6 @@ def skeleton_calibration(
         for point in _stabilize_skeleton_points(points, bone_lengths)
     ]
     return _skeleton_axis_ranges_from_points(stabilized_points), bone_lengths
-
-
-def skeleton_figure(
-    data: bytes,
-    axis_ranges: SkeletonAxisRanges | None = None,
-    uirevision: str = "skeleton",
-) -> go.Figure | None:
-    people = _skeleton_people(data)
-    if not people:
-        return None
-    figure = go.Figure()
-    plotted_points: list[tuple[float, float, float]] = []
-    for person_index, (points, scores) in enumerate(people):
-        x = [point[0] for point in points]
-        y = [point[1] for point in points]
-        z = [point[2] for point in points]
-        plotted_points.extend(points)
-        edge_x: list[float | None] = []
-        edge_y: list[float | None] = []
-        edge_z: list[float | None] = []
-        for start, end in SKELETON_EDGES:
-            edge_x.extend((x[start], x[end], None))
-            edge_y.extend((y[start], y[end], None))
-            edge_z.extend((z[start], z[end], None))
-        figure.add_trace(
-            go.Scatter3d(
-                x=edge_x,
-                y=edge_y,
-                z=edge_z,
-                mode="lines",
-                line={"color": SKELETON_COLORS[person_index % len(SKELETON_COLORS)], "width": 7},
-                showlegend=False,
-                hoverinfo="skip",
-            )
-        )
-        figure.add_trace(
-            go.Scatter3d(
-                x=x,
-                y=y,
-                z=z,
-                mode="markers",
-                marker={
-                    "color": SKELETON_COLORS[person_index % len(SKELETON_COLORS)],
-                    "size": [max(4, min(9, score * 8)) for score in scores],
-                },
-                name=f"Person {person_index + 1}",
-                text=[
-                    f"{name}<br>score={score:.3f}"
-                    for name, score in zip(SKELETON_JOINT_NAMES, scores, strict=True)
-                ],
-                hoverinfo="text",
-            )
-        )
-    if not figure.data:
-        return None
-
-    # Fall back to frame-local bounds for standalone callers. The clip explorer
-    # supplies bounds computed from every frame so playback never zooms.
-    axis_ranges = axis_ranges or _skeleton_axis_ranges_from_points(plotted_points)
-    assert axis_ranges is not None
-    figure.update_layout(
-        height=520,
-        margin={"l": 0, "r": 0, "t": 20, "b": 0},
-        uirevision=uirevision,
-        scene={
-            "aspectmode": "cube",
-            "uirevision": uirevision,
-            "camera": {
-                "up": {"x": 0, "y": 0, "z": 1},
-                # Look straight along the sensor depth axis. From +y, negative
-                # skeleton x appears on camera-right, matching the paired
-                # Depth Color and IR frames.
-                "eye": {"x": 0, "y": 2.5, "z": 0},
-                "projection": {"type": "orthographic"},
-            },
-            "xaxis": {"title": "Horizontal (x)", "range": axis_ranges[0]},
-            "yaxis": {"title": "Depth (y)", "range": axis_ranges[1]},
-            "zaxis": {"title": "Height (z)", "range": axis_ranges[2]},
-        },
-    )
-    return figure
-
-
-def _skeleton_viewer_html(
-    data: bytes,
-    axis_ranges: SkeletonAxisRanges | None,
-    bone_lengths: SkeletonBoneLengths | None,
-    playback_identity: str,
-) -> str | None:
-    """Build an interactive skeleton viewer whose camera survives reruns."""
-
-    people = _skeleton_people(data)
-    if not people:
-        return None
-    if bone_lengths is not None:
-        people = [
-            (_stabilize_skeleton_points(person_points, bone_lengths), scores)
-            for person_points, scores in people
-        ]
-    points = [point for person_points, _ in people for point in person_points]
-    axis_ranges = axis_ranges or _skeleton_axis_ranges_from_points(points)
-    if axis_ranges is None:
-        return None
-
-    model = {
-        "people": [
-            {
-                "points": person_points,
-                "scores": scores,
-                "color": SKELETON_COLORS[index % len(SKELETON_COLORS)],
-                "name": f"Person {index + 1}",
-            }
-            for index, (person_points, scores) in enumerate(people)
-        ],
-        "edges": SKELETON_EDGES,
-        "jointNames": SKELETON_JOINT_NAMES,
-        "ranges": axis_ranges,
-    }
-    model_json = json.dumps(model, separators=(",", ":")).replace("</", "<\\/")
-    storage_key = json.dumps(f"cuhkx:skeleton-camera:{playback_identity}").replace("</", "<\\/")
-    template = """
-<style>
-  html, body { margin: 0; overflow: hidden; background: transparent; font-family: sans-serif; }
-  #viewer { position: relative; width: 100%; height: 520px; }
-  canvas { display: block; width: 100%; height: 100%; cursor: grab; touch-action: none; }
-  canvas.dragging { cursor: grabbing; }
-  #hint { position: absolute; left: 10px; top: 8px; color: #6b7280; font-size: 12px; }
-  #reset { position: absolute; right: 10px; top: 8px; border: 1px solid #aeb4bd;
-    border-radius: 6px; padding: 5px 9px; background: rgba(255,255,255,.86); cursor: pointer; }
-  #tooltip { display: none; position: absolute; pointer-events: none; padding: 5px 7px;
-    border-radius: 5px; background: rgba(30,34,40,.9); color: white; font-size: 12px; }
-</style>
-<div id="viewer">
-  <canvas id="skeleton"></canvas>
-  <div id="hint">Drag to rotate · Scroll to zoom</div>
-  <button id="reset" type="button">Reset view</button>
-  <div id="tooltip"></div>
-</div>
-<script>
-(() => {
-  const model = __MODEL__;
-  const storageKey = __STORAGE_KEY__;
-  const canvas = document.getElementById("skeleton");
-  const context = canvas.getContext("2d");
-  const tooltip = document.getElementById("tooltip");
-  const defaultCamera = {yaw: 0, pitch: 0, zoom: 1};
-  // Pitch must stay clear of straight up/down: the basis takes cross(forward,
-  // [0,0,1]), which degenerates to a zero vector there and collapses every
-  // projected point onto the centre. Clamp on restore too, not just on drag,
-  // so stored state from another build cannot produce a blank viewer.
-  const clampCamera = value => {
-    const number = (input, fallback) => (Number.isFinite(input) ? input : fallback);
-    return {
-      yaw: number(value.yaw, 0),
-      pitch: Math.max(-1.45, Math.min(1.45, number(value.pitch, 0))),
-      zoom: Math.max(0.55, Math.min(2.5, number(value.zoom, 1))),
-    };
-  };
-  let camera = {...defaultCamera};
-  try {
-    const stored = JSON.parse(window.parent.sessionStorage.getItem(storageKey) || "{}");
-    if (stored && typeof stored === "object") camera = clampCamera({...camera, ...stored});
-  } catch (_) {}
-  let dragging = false;
-  let lastPointer = null;
-  let projectedJoints = [];
-
-  const add = (a, b) => a.map((value, index) => value + b[index]);
-  const scale = (value, amount) => value.map(item => item * amount);
-  const dot = (a, b) => a.reduce((total, value, index) => total + value * b[index], 0);
-  const cross = (a, b) => [
-    a[1] * b[2] - a[2] * b[1],
-    a[2] * b[0] - a[0] * b[2],
-    a[0] * b[1] - a[1] * b[0],
-  ];
-  const normalize = value => {
-    const length = Math.sqrt(dot(value, value)) || 1;
-    return scale(value, 1 / length);
-  };
-  const centers = model.ranges.map(range => (range[0] + range[1]) / 2);
-  const halfSpan = (model.ranges[0][1] - model.ranges[0][0]) / 2;
-
-  function saveCamera() {
-    try { window.parent.sessionStorage.setItem(storageKey, JSON.stringify(camera)); } catch (_) {}
-  }
-
-  function basis() {
-    const horizontal = Math.cos(camera.pitch);
-    const eye = normalize([
-      Math.sin(camera.yaw) * horizontal,
-      Math.cos(camera.yaw) * horizontal,
-      Math.sin(camera.pitch),
-    ]);
-    const forward = scale(eye, -1);
-    const right = normalize(cross(forward, [0, 0, 1]));
-    return {eye, right, up: normalize(cross(right, forward))};
-  }
-
-  function project(point, width, height, cameraBasis) {
-    const centered = point.map((value, index) => (value - centers[index]) / halfSpan);
-    const pixels = Math.min(width, height) * 0.37 * camera.zoom;
-    return {
-      x: width / 2 + dot(centered, cameraBasis.right) * pixels,
-      y: height / 2 - dot(centered, cameraBasis.up) * pixels,
-      depth: dot(centered, cameraBasis.eye),
-    };
-  }
-
-  function draw() {
-    const width = canvas.clientWidth;
-    const height = canvas.clientHeight;
-    const ratio = window.devicePixelRatio || 1;
-    if (canvas.width !== Math.round(width * ratio) || canvas.height !== Math.round(height * ratio)) {
-      canvas.width = Math.round(width * ratio);
-      canvas.height = Math.round(height * ratio);
-    }
-    context.setTransform(ratio, 0, 0, ratio, 0, 0);
-    context.clearRect(0, 0, width, height);
-    const cameraBasis = basis();
-
-    const cube = [];
-    for (let index = 0; index < 8; index++) {
-      cube.push(project([
-        centers[0] + (index & 1 ? halfSpan : -halfSpan),
-        centers[1] + (index & 2 ? halfSpan : -halfSpan),
-        centers[2] + (index & 4 ? halfSpan : -halfSpan),
-      ], width, height, cameraBasis));
-    }
-    context.strokeStyle = "rgba(128,136,148,.28)";
-    context.lineWidth = 1;
-    for (const [start, end] of [[0,1],[0,2],[0,4],[1,3],[1,5],[2,3],[2,6],[3,7],[4,5],[4,6],[5,7],[6,7]]) {
-      context.beginPath();
-      context.moveTo(cube[start].x, cube[start].y);
-      context.lineTo(cube[end].x, cube[end].y);
-      context.stroke();
-    }
-
-    projectedJoints = [];
-    for (const person of model.people) {
-      const projected = person.points.map(point => project(point, width, height, cameraBasis));
-      const bones = model.edges.map(edge => ({edge, depth: (projected[edge[0]].depth + projected[edge[1]].depth) / 2}));
-      bones.sort((a, b) => a.depth - b.depth);
-      context.strokeStyle = person.color;
-      context.lineWidth = 6;
-      context.lineCap = "round";
-      for (const bone of bones) {
-        const start = projected[bone.edge[0]];
-        const end = projected[bone.edge[1]];
-        context.beginPath();
-        context.moveTo(start.x, start.y);
-        context.lineTo(end.x, end.y);
-        context.stroke();
-      }
-      projected.forEach((point, index) => {
-        const radius = Math.max(4, Math.min(8, person.scores[index] * 7));
-        context.beginPath();
-        context.arc(point.x, point.y, radius, 0, Math.PI * 2);
-        context.fillStyle = person.color;
-        context.fill();
-        context.strokeStyle = "white";
-        context.lineWidth = 1;
-        context.stroke();
-        projectedJoints.push({...point, radius, label: `${person.name} · ${model.jointNames[index]} · score=${person.scores[index].toFixed(3)}`});
-      });
-    }
-  }
-
-  canvas.addEventListener("pointerdown", event => {
-    dragging = true;
-    lastPointer = [event.clientX, event.clientY];
-    canvas.classList.add("dragging");
-    canvas.setPointerCapture(event.pointerId);
-    tooltip.style.display = "none";
-  });
-  canvas.addEventListener("pointermove", event => {
-    if (dragging) {
-      const dx = event.clientX - lastPointer[0];
-      const dy = event.clientY - lastPointer[1];
-      camera.yaw -= dx * 0.008;
-      camera.pitch = Math.max(-1.45, Math.min(1.45, camera.pitch + dy * 0.008));
-      lastPointer = [event.clientX, event.clientY];
-      saveCamera();
-      draw();
-      return;
-    }
-    const bounds = canvas.getBoundingClientRect();
-    const x = event.clientX - bounds.left;
-    const y = event.clientY - bounds.top;
-    const nearest = projectedJoints
-      .map(joint => ({joint, distance: Math.hypot(joint.x - x, joint.y - y)}))
-      .sort((a, b) => a.distance - b.distance)[0];
-    if (!nearest || nearest.distance > nearest.joint.radius + 5) {
-      tooltip.style.display = "none";
-      return;
-    }
-    tooltip.textContent = nearest.joint.label;
-    tooltip.style.left = `${x + 12}px`;
-    tooltip.style.top = `${y + 12}px`;
-    tooltip.style.display = "block";
-  });
-  canvas.addEventListener("pointerup", event => {
-    dragging = false;
-    canvas.classList.remove("dragging");
-    canvas.releasePointerCapture(event.pointerId);
-    saveCamera();
-  });
-  canvas.addEventListener("wheel", event => {
-    event.preventDefault();
-    camera.zoom = Math.max(0.55, Math.min(2.5, camera.zoom * Math.exp(-event.deltaY * 0.001)));
-    saveCamera();
-    draw();
-  }, {passive: false});
-  document.getElementById("reset").addEventListener("click", () => {
-    camera = {...defaultCamera};
-    saveCamera();
-    draw();
-  });
-  new ResizeObserver(draw).observe(document.getElementById("viewer"));
-  draw();
-})();
-</script>
-"""
-    return template.replace("__MODEL__", model_json).replace("__STORAGE_KEY__", storage_key)
-
-
-def _render_skeleton_viewer(html: str) -> None:
-    if hasattr(st, "iframe"):
-        st.iframe(html, width="stretch", height=520, tab_index=0)
-    else:  # pragma: no cover - compatibility with older supported Streamlit
-        # requirements.txt still allows streamlit<1.62, which has no st.iframe.
-        # components.html sandboxes the frame, so window.parent.sessionStorage
-        # throws and the camera simply resets between reruns instead of
-        # persisting. The viewer itself works either way.
-        components.html(html, height=520)
 
 
 def _float_at(row: list[str], index: int) -> float | None:
@@ -1214,117 +861,922 @@ def imu_figure(payloads: dict[str, bytes], paths: list[str]) -> go.Figure | None
     return figure
 
 
-def radar_figure(data: bytes, position: int) -> tuple[go.Figure | None, int, int]:
-    text = data.decode("utf-8-sig", errors="replace")
-    rows = list(csv.DictReader(io.StringIO(text)))
-    rows = [row for row in rows if row.get("frame") not in (None, "")]
-    if not rows:
-        return None, 0, 0
-    frames = sorted({int(float(row["frame"])) for row in rows})
-    selected = frames[round((len(frames) - 1) * position / 100)]
-    points = [row for row in rows if int(float(row["frame"])) == selected]
+PLAYER_MODALITIES = ("Depth_Color", "IR", "Thermal", "Skeleton")
 
-    def values(name: str) -> list[float]:
-        result = []
-        for row in points:
-            try:
-                result.append(float(row[name]))
-            except (KeyError, TypeError, ValueError):
-                result.append(0.0)
-        return result
 
-    snr = values("snr")
-    velocity = values("v")
-    figure = go.Figure(
-        go.Scatter3d(
-            x=values("x"),
-            y=values("y"),
-            z=values("z"),
-            mode="markers",
-            marker={
-                "size": [max(3, min(11, value / 30)) for value in snr],
-                "color": velocity,
-                "colorscale": "RdBu",
-                "cmid": 0,
-                "colorbar": {"title": "velocity"},
-                "opacity": 0.82,
-            },
-            text=[f"frame={selected}<br>SNR={snr[index]:.0f}<br>v={velocity[index]:.3f}" for index in range(len(points))],
-            hoverinfo="text",
+def _timeline_selections(
+    modalities: Mapping[str, list[str]],
+    frame_count: int,
+) -> list[dict[str, str | None]]:
+    """Resolve every displayed modality path before client-side playback starts."""
+
+    selections: list[dict[str, str | None]] = []
+    for frame_index in range(frame_count):
+        selected: dict[str, str | None] = {}
+        for modality in PLAYER_MODALITIES:
+            paths = modalities.get(modality, [])
+            path = paths[timeline_member_index(frame_index, frame_count, len(paths))] if paths else None
+            selected[modality] = path
+        selections.append(selected)
+    return selections
+
+
+def _selected_paths(
+    selections: Iterable[Mapping[str, str | None]],
+    modalities: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Return the distinct members the player needs, in first-use order."""
+
+    return tuple(
+        dict.fromkeys(
+            path
+            for selection in selections
+            for modality in modalities
+            if (path := selection.get(modality)) is not None
         )
     )
-    figure.update_layout(
-        height=520,
-        margin={"l": 0, "r": 0, "t": 30, "b": 0},
-        scene={"aspectmode": "data", "xaxis_title": "x", "yaxis_title": "y", "zaxis_title": "z"},
-    )
-    return figure, selected, len(frames)
 
 
-def render_visual_frame(
-    modalities: dict[str, list[str]],
+# The player inlines every frame of a clip as a data URI, so the payload grows
+# with clip length rather than with what is on screen. These steps trade
+# resolution for total size once a clip is long enough that the default would
+# push the whole document past a comfortable size. Depth Color and IR are
+# 640x480 and Thermal is 320x240, so the first step re-encodes without
+# resizing; the later ones genuinely shrink.
+IMAGE_ENCODING_STEPS = ((640, 82), (512, 76), (400, 70), (320, 64))
+CLIP_PLAYER_IMAGE_BUDGET = 24 * 1024 * 1024
+CLIP_PLAYER_HEIGHT = 1160
+
+
+def _image_encoding(image_count: int) -> tuple[int, int]:
+    """Pick a resize bound and JPEG quality from how many frames must be inlined."""
+
+    for step, (max_edge, quality) in enumerate(IMAGE_ENCODING_STEPS):
+        if image_count <= 120 * (step + 1) ** 2:
+            return max_edge, quality
+    return IMAGE_ENCODING_STEPS[-1]
+
+
+def _image_data_uri(path: str, payload: bytes, max_edge: int, quality: int) -> str | None:
+    """Re-encode one frame as a JPEG data URI, or ``None`` if it cannot be shown.
+
+    Falls back to the original bytes when Pillow cannot read the file, but only
+    for suffixes a browser can actually decode; an unknown suffix returns
+    ``None`` so the player reports the frame as unavailable rather than
+    embedding a URI that silently fails to load.
+    """
+
+    try:
+        with Image.open(io.BytesIO(payload)) as image:
+            image.thumbnail((max_edge, max_edge), Image.Resampling.LANCZOS)
+            if image.mode != "RGB":
+                image = image.convert("RGB")
+            output = io.BytesIO()
+            image.save(output, format="JPEG", quality=quality, optimize=True)
+        encoded = base64.b64encode(output.getvalue()).decode("ascii")
+        return f"data:image/jpeg;base64,{encoded}"
+    except (OSError, ValueError):
+        mime_type = {
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".png": "image/png",
+            ".webp": "image/webp",
+            ".gif": "image/gif",
+        }.get(PurePosixPath(path).suffix.lower())
+        if mime_type is None:
+            return None
+        encoded = base64.b64encode(payload).decode("ascii")
+        return f"data:{mime_type};base64,{encoded}"
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def cached_image_assets(
     source_data: dict[str, str],
-    static_payloads: dict[str, bytes],
+    image_paths: tuple[str, ...],
+) -> tuple[dict[str, str], tuple[int, int]]:
+    """Return one clip's frames as data URIs plus the encoding actually used.
+
+    Reading through here rather than ``cached_payloads`` keeps the raw frame
+    bytes transient. Caching both would hold two full copies of every clip that
+    has been opened: the originals and the re-encoded JPEGs.
+
+    The encoding is returned rather than recomputed by the caller so the size
+    reported under the player cannot drift from what was encoded.
+    """
+
+    encoding = _image_encoding(len(image_paths))
+    max_edge, quality = encoding
+    payloads = read_members(source_from_dict(source_data), image_paths)
+    assets: dict[str, str] = {}
+    for path in image_paths:
+        payload = payloads.get(path)
+        if payload is None:
+            continue
+        uri = _image_data_uri(path, payload, max_edge, quality)
+        if uri is not None:
+            assets[path] = uri
+    return assets, encoding
+
+
+def _radar_playback_frames(data: bytes | None) -> list[dict[str, object]]:
+    """Parse one radar CSV once, rather than rebuilding a Plotly figure per tick."""
+
+    if not data:
+        return []
+    grouped: dict[int, dict[str, object]] = {}
+    rows = csv.DictReader(io.StringIO(data.decode("utf-8-sig", errors="replace")))
+
+    def number(row: Mapping[str, str | None], name: str) -> float:
+        try:
+            return float(row.get(name) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    for row in rows:
+        try:
+            frame_number = int(float(row.get("frame") or ""))
+        except (TypeError, ValueError):
+            continue
+        frame = grouped.setdefault(
+            frame_number,
+            {"frame": frame_number, "x": [], "y": [], "z": [], "velocity": [], "snr": []},
+        )
+        for column, key in (("x", "x"), ("y", "y"), ("z", "z"), ("v", "velocity"), ("snr", "snr")):
+            values = frame[key]
+            assert isinstance(values, list)
+            values.append(number(row, column))
+    return [grouped[frame_number] for frame_number in sorted(grouped)]
+
+
+def _clip_player_model(
+    selections: list[dict[str, str | None]],
+    image_assets: Mapping[str, str],
+    skeleton_payloads: Mapping[str, bytes],
+    radar_payload: bytes | None,
     skeleton_ranges: SkeletonAxisRanges | None,
     skeleton_bone_lengths: SkeletonBoneLengths | None,
     playback_identity: str,
-    position: int,
-) -> None:
-    """Render all modalities that change as the playback cursor advances."""
+    intervals_ms: Mapping[str, int],
+) -> dict[str, object]:
+    # Several timeline frames map to the same skeleton file whenever the pose
+    # stream is shorter than the timeline, so parse and stabilize each file once.
+    poses_by_path: dict[str, list[dict[str, object]]] = {}
 
-    selected_images = {
-        modality: choose_member(modalities.get(modality, []), position)
-        for modality in ("Depth_Color", "IR", "Thermal")
+    def poses_for(path: str | None) -> list[dict[str, object]]:
+        if path is None or path not in skeleton_payloads:
+            return []
+        if path not in poses_by_path:
+            people = _skeleton_people(skeleton_payloads[path])
+            if skeleton_bone_lengths is not None:
+                people = [
+                    (_stabilize_skeleton_points(points, skeleton_bone_lengths), scores)
+                    for points, scores in people
+                ]
+            poses_by_path[path] = [
+                {
+                    "points": points,
+                    "scores": scores,
+                    "color": SKELETON_COLORS[index % len(SKELETON_COLORS)],
+                    "name": f"Person {index + 1}",
+                }
+                for index, (points, scores) in enumerate(people)
+            ]
+        return poses_by_path[path]
+
+    frames: list[dict[str, object]] = []
+    for selection in selections:
+        frames.append(
+            {
+                "images": {
+                    modality: selection.get(modality)
+                    for modality in ("Depth_Color", "IR", "Thermal")
+                },
+                "skeleton": poses_for(selection.get("Skeleton")),
+            }
+        )
+    return {
+        "identity": playback_identity,
+        "frames": frames,
+        "imageAssets": dict(image_assets),
+        "radarFrames": _radar_playback_frames(radar_payload),
+        "skeleton": {
+            "edges": SKELETON_EDGES,
+            "jointNames": SKELETON_JOINT_NAMES,
+            "ranges": skeleton_ranges,
+        },
+        "intervalsMs": dict(intervals_ms),
     }
-    skeleton_path = choose_member(modalities.get("Skeleton", []), position)
-    radar_paths = modalities.get("Radar", [])
-    wanted = [path for path in selected_images.values() if path]
-    if skeleton_path:
-        wanted.append(skeleton_path)
-    frame_payloads = cached_payloads(source_data, tuple(dict.fromkeys(wanted))) if wanted else {}
-    payloads = {**static_payloads, **frame_payloads}
 
-    st.subheader("Visual streams")
-    image_columns = st.columns(3)
-    for column, modality in zip(image_columns, ("Depth_Color", "IR", "Thermal")):
-        with column:
-            st.markdown(f"**{modality}**")
-            path = selected_images[modality]
-            if path:
-                st.image(payloads[path], caption=PurePosixPath(path).name, width="stretch")
-            else:
-                st.info("Unavailable")
 
-    skeleton_column, radar_column = st.columns(2)
-    with skeleton_column:
-        st.subheader("3D skeleton")
-        if skeleton_path:
-            viewer_html = _skeleton_viewer_html(
-                payloads[skeleton_path],
-                skeleton_ranges,
-                skeleton_bone_lengths,
-                playback_identity,
-            )
-            if viewer_html is not None:
-                _render_skeleton_viewer(viewer_html)
-                st.caption(
-                    "Human3.6M 17-joint pose · camera-aligned · clip-stabilized limb lengths."
-                )
-            else:
-                st.info("No valid person pose in this frame.")
+@lru_cache(maxsize=1)
+def _plotly_script() -> str:
+    """Escape the bundled plotly.js once; it is several megabytes and constant."""
+
+    return get_plotlyjs().replace("</script", "<\\/script")
+
+
+def _clip_player_html(model: Mapping[str, object]) -> str:
+    """Return one persistent, self-contained browser player for a whole clip."""
+
+    model_json = json.dumps(model, separators=(",", ":")).replace("</", "<\\/")
+    has_radar = bool(model.get("radarFrames"))
+    plotly_javascript = _plotly_script() if has_radar else ""
+    template = r"""
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: transparent; font-family: sans-serif;
+    color: #31333f; }
+  /* The host iframe is a fixed height, but the grids below collapse to one
+     column on narrow viewports and the image panels grow with width. Scroll
+     inside the player so neither end of that range clips content: st.iframe
+     has no scrolling parameter to fall back on. */
+  #player { height: 100%; overflow-y: auto; overflow-x: hidden; padding-right: 4px; }
+  button, select, input { font: inherit; }
+  .toolbar { display: grid; grid-template-columns: auto auto minmax(125px, auto) 1fr;
+    gap: 10px; align-items: end; margin: 0 0 12px; }
+  button, select { min-height: 38px; border: 1px solid #c8cdd4; border-radius: 7px;
+    background: #fff; color: inherit; padding: 7px 12px; }
+  button { cursor: pointer; font-weight: 600; }
+  button:disabled { cursor: wait; opacity: .55; }
+  label { display: grid; gap: 3px; font-size: 12px; color: #60646c; }
+  #timeline { width: 100%; margin-bottom: 5px; }
+  #timelineText { font-size: 13px; color: #60646c; white-space: nowrap; }
+  #loadStatus { min-height: 18px; margin-bottom: 4px; font-size: 12px; color: #60646c; }
+  h3 { margin: 12px 0 8px; font-size: 1.25rem; }
+  h4 { margin: 0 0 8px; font-size: 1rem; }
+  .stream-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+  .lower-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px;
+    margin-top: 18px; }
+  .panel { min-width: 0; }
+  .frame { position: relative; width: 100%; overflow: hidden; border: 1px solid #d8dce2;
+    border-radius: 7px; background: #090b0f; }
+  .image-frame { aspect-ratio: 4 / 3; }
+  .viewer-frame { height: 520px; }
+  canvas { display: block; width: 100%; height: 100%; }
+  #skeleton { cursor: grab; touch-action: none; }
+  #skeleton.dragging { cursor: grabbing; }
+  .caption { min-height: 34px; padding-top: 5px; color: #60646c; font-size: 12px;
+    overflow-wrap: anywhere; }
+  .hint { position: absolute; left: 10px; top: 8px; color: #8a919d; font-size: 12px;
+    pointer-events: none; }
+  #resetCamera { position: absolute; right: 10px; top: 8px; z-index: 2; min-height: 30px;
+    padding: 4px 9px; background: rgba(255,255,255,.88); color: #31333f; }
+  #tooltip { display: none; position: absolute; pointer-events: none; z-index: 3;
+    padding: 5px 7px; border-radius: 5px; background: rgba(30,34,40,.92); color: white;
+    font-size: 12px; }
+  #radar { width: 100%; height: 518px; }
+  .message { display: grid; place-items: center; width: 100%; height: 100%; color: #8a919d;
+    font-size: 14px; }
+  @media (prefers-color-scheme: dark) {
+    html, body { color: #fafafa; }
+    button, select { background: #1c1f26; border-color: #4b515c; }
+    label, #timelineText, #loadStatus, .caption { color: #a9afb9; }
+    .frame { border-color: #3d434d; }
+  }
+  @media (max-width: 760px) {
+    .toolbar { grid-template-columns: 1fr 1fr; }
+    .toolbar .timeline-control { grid-column: 1 / -1; }
+    .stream-grid, .lower-grid { grid-template-columns: 1fr; }
+  }
+</style>
+<div id="player">
+  <div class="toolbar">
+    <button id="toggle" type="button" disabled>▶ Play</button>
+    <button id="restart" type="button">↺ Restart</button>
+    <label>Speed
+      <select id="speed">
+        <option value="0.5">0.5×</option>
+        <option value="1" selected>1×</option>
+        <option value="2">2×</option>
+      </select>
+    </label>
+    <div class="timeline-control">
+      <input id="timeline" type="range" min="0" value="0" step="1">
+      <div id="timelineText"></div>
+    </div>
+  </div>
+  <div id="loadStatus">Loading clip frames…</div>
+  <h3>Visual streams</h3>
+  <div class="stream-grid">
+    <div class="panel"><h4>Depth_Color</h4><div class="frame image-frame"><canvas id="image-Depth_Color"></canvas></div><div class="caption" id="caption-Depth_Color"></div></div>
+    <div class="panel"><h4>IR</h4><div class="frame image-frame"><canvas id="image-IR"></canvas></div><div class="caption" id="caption-IR"></div></div>
+    <div class="panel"><h4>Thermal</h4><div class="frame image-frame"><canvas id="image-Thermal"></canvas></div><div class="caption" id="caption-Thermal"></div></div>
+  </div>
+  <div class="lower-grid">
+    <div class="panel">
+      <h3>3D skeleton</h3>
+      <div class="frame viewer-frame" id="skeletonFrame">
+        <canvas id="skeleton"></canvas>
+        <div class="hint">Drag to rotate · Scroll to zoom</div>
+        <button id="resetCamera" type="button">Reset view</button>
+        <div id="tooltip"></div>
+      </div>
+      <div class="caption">Human3.6M 17-joint pose · camera-aligned · clip-stabilized limb lengths.</div>
+    </div>
+    <div class="panel">
+      <h3>Radar point cloud</h3>
+      <div class="frame viewer-frame"><div id="radar"></div></div>
+      <div class="caption" id="radarCaption"></div>
+    </div>
+  </div>
+</div>
+<script>__PLOTLY__</script>
+<script>
+(() => {
+  const model = __MODEL__;
+  const modalities = ["Depth_Color", "IR", "Thermal"];
+  const frameCount = Math.max(1, model.frames.length);
+  const toggle = document.getElementById("toggle");
+  const restart = document.getElementById("restart");
+  const speedControl = document.getElementById("speed");
+  const timeline = document.getElementById("timeline");
+  const timelineText = document.getElementById("timelineText");
+  const loadStatus = document.getElementById("loadStatus");
+  const skeletonCanvas = document.getElementById("skeleton");
+  const tooltip = document.getElementById("tooltip");
+  const radar = document.getElementById("radar");
+  const radarCaption = document.getElementById("radarCaption");
+  timeline.max = String(frameCount - 1);
+
+  let currentFrame = 0;
+  let playing = false;
+  let timer = null;
+  let timerGeneration = 0;
+  let ready = false;
+  let radarReady = false;
+  let radarInitializing = false;
+  const imageCache = new Map();
+  const imagePromises = new Map();
+
+  // Every async path below ends in a promise nothing awaits. Without this the
+  // failure mode is a silent deadlock: the status line keeps saying "Loading",
+  // or playback stops while the button still reads "Pause", with no clue why.
+  function reportError(stage, error) {
+    console.error(`clip player: ${stage}`, error);
+    loadStatus.textContent = `${stage} failed: ${error && error.message ? error.message : error}`;
+    return null;
+  }
+
+  function canvasSize(canvas) {
+    const width = Math.max(1, canvas.clientWidth);
+    const height = Math.max(1, canvas.clientHeight);
+    const ratio = window.devicePixelRatio || 1;
+    const pixelWidth = Math.round(width * ratio);
+    const pixelHeight = Math.round(height * ratio);
+    if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
+      canvas.width = pixelWidth;
+      canvas.height = pixelHeight;
+    }
+    const context = canvas.getContext("2d");
+    context.setTransform(ratio, 0, 0, ratio, 0, 0);
+    return {context, width, height};
+  }
+
+  function message(context, width, height, value) {
+    context.clearRect(0, 0, width, height);
+    context.fillStyle = "#8a919d";
+    context.font = "14px sans-serif";
+    context.textAlign = "center";
+    context.textBaseline = "middle";
+    context.fillText(value, width / 2, height / 2);
+  }
+
+  function imagePathsForFrame(index) {
+    if (index < 0 || index >= frameCount) return [];
+    return modalities
+      .map(modality => model.frames[index]?.images?.[modality] || null)
+      .filter(path => path !== null && model.imageAssets[path]);
+  }
+
+  function ensureImage(path) {
+    if (imagePromises.has(path)) return imagePromises.get(path);
+    const promise = new Promise(resolve => {
+      const image = new Image();
+      image.onload = () => resolve();
+      image.onerror = () => resolve();
+      imageCache.set(path, image);
+      image.src = model.imageAssets[path];
+    });
+    imagePromises.set(path, promise);
+    return promise;
+  }
+
+  function ensureFrame(index) {
+    return Promise.all(imagePathsForFrame(index).map(ensureImage));
+  }
+
+  function warmFrames(first, last) {
+    const promises = [];
+    for (let index = Math.max(0, first); index <= Math.min(frameCount - 1, last); index++) {
+      promises.push(ensureFrame(index));
+    }
+    return Promise.all(promises);
+  }
+
+  function trimImageCache(center) {
+    const retained = new Set();
+    for (let index = Math.max(0, center - 2); index <= Math.min(frameCount - 1, center + 5); index++) {
+      imagePathsForFrame(index).forEach(path => retained.add(path));
+    }
+    for (const path of imageCache.keys()) {
+      if (!retained.has(path)) {
+        // Dropping the reference is enough to release the decoded bitmap.
+        // Assigning src = "" would re-request the document URL and fire error.
+        imageCache.delete(path);
+        imagePromises.delete(path);
+      }
+    }
+  }
+
+  const warmAround = frame =>
+    warmFrames(frame + 1, frame + 4)
+      .then(() => trimImageCache(currentFrame))
+      .catch(error => reportError("Preloading frames", error));
+
+  function drawImage(modality) {
+    const canvas = document.getElementById(`image-${modality}`);
+    const {context, width, height} = canvasSize(canvas);
+    const path = model.frames[currentFrame]?.images?.[modality] || null;
+    const caption = document.getElementById(`caption-${modality}`);
+    caption.textContent = path ? path.split("/").pop() : "Unavailable";
+    if (!path) {
+      message(context, width, height, "Unavailable");
+      return;
+    }
+    const image = imageCache.get(path);
+    if (!ready || !image || !image.complete || !image.naturalWidth) {
+      message(context, width, height, ready ? "Could not decode frame" : "Loading…");
+      return;
+    }
+    context.clearRect(0, 0, width, height);
+    context.fillStyle = "#090b0f";
+    context.fillRect(0, 0, width, height);
+    const scale = Math.min(width / image.naturalWidth, height / image.naturalHeight);
+    const drawWidth = image.naturalWidth * scale;
+    const drawHeight = image.naturalHeight * scale;
+    context.drawImage(image, (width - drawWidth) / 2, (height - drawHeight) / 2, drawWidth, drawHeight);
+  }
+
+  const cameraStorageKey = `cuhkx:skeleton-camera:${model.identity}`;
+  const defaultCamera = {yaw: 0, pitch: 0, zoom: 1};
+  const clampCamera = value => {
+    const number = (input, fallback) => Number.isFinite(input) ? input : fallback;
+    return {
+      yaw: number(value.yaw, 0),
+      pitch: Math.max(-1.45, Math.min(1.45, number(value.pitch, 0))),
+      zoom: Math.max(0.55, Math.min(2.5, number(value.zoom, 1))),
+    };
+  };
+  let camera = {...defaultCamera};
+  try {
+    const stored = JSON.parse(window.parent.sessionStorage.getItem(cameraStorageKey) || "{}");
+    if (stored && typeof stored === "object") camera = clampCamera({...camera, ...stored});
+  } catch (_) {}
+  let dragging = false;
+  let lastPointer = null;
+  let projectedJoints = [];
+  const scaleVector = (value, amount) => value.map(item => item * amount);
+  const dot = (a, b) => a.reduce((total, value, index) => total + value * b[index], 0);
+  const cross = (a, b) => [
+    a[1] * b[2] - a[2] * b[1],
+    a[2] * b[0] - a[0] * b[2],
+    a[0] * b[1] - a[1] * b[0],
+  ];
+  const normalize = value => {
+    const length = Math.sqrt(dot(value, value)) || 1;
+    return scaleVector(value, 1 / length);
+  };
+
+  function saveCamera() {
+    try { window.parent.sessionStorage.setItem(cameraStorageKey, JSON.stringify(camera)); } catch (_) {}
+  }
+
+  function cameraBasis() {
+    const horizontal = Math.cos(camera.pitch);
+    const eye = normalize([
+      Math.sin(camera.yaw) * horizontal,
+      Math.cos(camera.yaw) * horizontal,
+      Math.sin(camera.pitch),
+    ]);
+    const forward = scaleVector(eye, -1);
+    const right = normalize(cross(forward, [0, 0, 1]));
+    return {eye, right, up: normalize(cross(right, forward))};
+  }
+
+  function drawSkeleton() {
+    const {context, width, height} = canvasSize(skeletonCanvas);
+    context.clearRect(0, 0, width, height);
+    const ranges = model.skeleton.ranges;
+    const people = model.frames[currentFrame]?.skeleton || [];
+    if (!ranges || !people.length) {
+      message(context, width, height, ranges ? "No valid person pose in this frame" : "Skeleton unavailable");
+      projectedJoints = [];
+      return;
+    }
+    const centers = ranges.map(range => (range[0] + range[1]) / 2);
+    const halfSpan = Math.max((ranges[0][1] - ranges[0][0]) / 2, 1e-6);
+    const basis = cameraBasis();
+    const project = point => {
+      const centered = point.map((value, index) => (value - centers[index]) / halfSpan);
+      const pixels = Math.min(width, height) * 0.37 * camera.zoom;
+      return {
+        x: width / 2 + dot(centered, basis.right) * pixels,
+        y: height / 2 - dot(centered, basis.up) * pixels,
+        depth: dot(centered, basis.eye),
+      };
+    };
+
+    const cube = [];
+    for (let index = 0; index < 8; index++) {
+      cube.push(project([
+        centers[0] + (index & 1 ? halfSpan : -halfSpan),
+        centers[1] + (index & 2 ? halfSpan : -halfSpan),
+        centers[2] + (index & 4 ? halfSpan : -halfSpan),
+      ]));
+    }
+    context.strokeStyle = "rgba(128,136,148,.28)";
+    context.lineWidth = 1;
+    for (const [start, end] of [[0,1],[0,2],[0,4],[1,3],[1,5],[2,3],[2,6],[3,7],[4,5],[4,6],[5,7],[6,7]]) {
+      context.beginPath();
+      context.moveTo(cube[start].x, cube[start].y);
+      context.lineTo(cube[end].x, cube[end].y);
+      context.stroke();
+    }
+
+    projectedJoints = [];
+    for (const person of people) {
+      const projected = person.points.map(project);
+      const bones = model.skeleton.edges.map(edge => ({
+        edge,
+        depth: (projected[edge[0]].depth + projected[edge[1]].depth) / 2,
+      })).sort((a, b) => a.depth - b.depth);
+      context.strokeStyle = person.color;
+      context.lineWidth = 6;
+      context.lineCap = "round";
+      for (const bone of bones) {
+        const start = projected[bone.edge[0]];
+        const end = projected[bone.edge[1]];
+        context.beginPath();
+        context.moveTo(start.x, start.y);
+        context.lineTo(end.x, end.y);
+        context.stroke();
+      }
+      projected.forEach((point, index) => {
+        const radius = Math.max(4, Math.min(8, person.scores[index] * 7));
+        context.beginPath();
+        context.arc(point.x, point.y, radius, 0, Math.PI * 2);
+        context.fillStyle = person.color;
+        context.fill();
+        context.strokeStyle = "white";
+        context.lineWidth = 1;
+        context.stroke();
+        projectedJoints.push({
+          ...point,
+          radius,
+          label: `${person.name} · ${model.skeleton.jointNames[index]} · score=${person.scores[index].toFixed(3)}`,
+        });
+      });
+    }
+  }
+
+  function radarAxis(values) {
+    if (!values.length) return [-1, 1];
+    const low = Math.min(...values);
+    const high = Math.max(...values);
+    const padding = Math.max((high - low) * 0.08, 0.05);
+    return [low - padding, high + padding];
+  }
+  const allRadar = model.radarFrames.flatMap(frame => frame.x.map((_, index) => ({
+    x: frame.x[index], y: frame.y[index], z: frame.z[index], velocity: frame.velocity[index],
+  })));
+  const radarRanges = {
+    x: radarAxis(allRadar.map(point => point.x)),
+    y: radarAxis(allRadar.map(point => point.y)),
+    z: radarAxis(allRadar.map(point => point.z)),
+  };
+  const maxVelocity = Math.max(0.001, ...allRadar.map(point => Math.abs(point.velocity)));
+
+  function radarFrameFor(index) {
+    if (!model.radarFrames.length) return null;
+    const radarIndex = frameCount <= 1 ? 0 : Math.round((model.radarFrames.length - 1) * index / (frameCount - 1));
+    return model.radarFrames[radarIndex];
+  }
+
+  function radarTrace(frame) {
+    return {
+      type: "scatter3d",
+      mode: "markers",
+      x: frame.x,
+      y: frame.y,
+      z: frame.z,
+      marker: {
+        size: frame.snr.map(value => Math.max(3, Math.min(11, value / 30))),
+        color: frame.velocity,
+        colorscale: "RdBu",
+        cmin: -maxVelocity,
+        cmax: maxVelocity,
+        cmid: 0,
+        colorbar: {title: "velocity"},
+        opacity: 0.82,
+      },
+      text: frame.snr.map((value, index) => `frame=${frame.frame}<br>SNR=${value.toFixed(0)}<br>v=${frame.velocity[index].toFixed(3)}`),
+      hoverinfo: "text",
+    };
+  }
+
+  function updateRadar() {
+    const frame = radarFrameFor(currentFrame);
+    if (!frame || typeof Plotly === "undefined") {
+      if (radar.dataset.empty !== "true") {
+        radar.innerHTML = '<div class="message">Radar unavailable or contains no detections</div>';
+        radar.dataset.empty = "true";
+        radarCaption.textContent = "";
+      }
+      return;
+    }
+    radarCaption.textContent = `Radar frame ${frame.frame}; ${model.radarFrames.length} frames contain detections.`;
+    if (!radarReady) {
+      if (radarInitializing) return;
+      radarInitializing = true;
+      const dark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+      Plotly.newPlot(radar, [radarTrace(frame)], {
+        height: 518,
+        margin: {l: 0, r: 0, t: 26, b: 0},
+        paper_bgcolor: "rgba(0,0,0,0)",
+        plot_bgcolor: "rgba(0,0,0,0)",
+        font: {color: dark ? "#fafafa" : "#31333f"},
+        uirevision: model.identity,
+        scene: {
+          aspectmode: "data",
+          uirevision: model.identity,
+          xaxis: {title: "x", range: radarRanges.x},
+          yaxis: {title: "y", range: radarRanges.y},
+          zaxis: {title: "z", range: radarRanges.z},
+        },
+      }, {responsive: true, displaylogo: false}).then(() => {
+        radarReady = true;
+        radarInitializing = false;
+        updateRadar();
+      }).catch(error => {
+        // Clear the guard, or every later updateRadar() returns early and the
+        // panel stays dead for the rest of the session.
+        radarInitializing = false;
+        radar.innerHTML = '<div class="message">Radar failed to render</div>';
+        radar.dataset.empty = "true";
+        radarCaption.textContent = "";
+        console.error("clip player: radar", error);
+      });
+      return;
+    }
+    const trace = radarTrace(frame);
+    Plotly.restyle(radar, {
+      x: [trace.x], y: [trace.y], z: [trace.z], text: [trace.text],
+      "marker.size": [trace.marker.size], "marker.color": [trace.marker.color],
+    }, [0]);
+  }
+
+  function updateControls() {
+    timeline.value = String(currentFrame);
+    const position = frameCount <= 1 ? 0 : Math.round(100 * currentFrame / (frameCount - 1));
+    timelineText.textContent = `Frame ${currentFrame + 1} of ${frameCount} · ${position}% through clip · ${Number(speedControl.value)}×`;
+    toggle.textContent = playing ? "⏸ Pause" : (currentFrame >= frameCount - 1 && frameCount > 1 ? "↻ Replay" : "▶ Play");
+  }
+
+  function drawFrame(index) {
+    currentFrame = Math.max(0, Math.min(Number(index) || 0, frameCount - 1));
+    modalities.forEach(drawImage);
+    drawSkeleton();
+    updateRadar();
+    updateControls();
+  }
+
+  function intervalMs() {
+    return model.intervalsMs[speedControl.value] || model.intervalsMs["1"] || 100;
+  }
+
+  function stopTimer() {
+    timerGeneration += 1;
+    if (timer !== null) window.clearTimeout(timer);
+    timer = null;
+  }
+
+  function schedule() {
+    stopTimer();
+    if (!playing) return;
+    const generation = timerGeneration;
+    timer = window.setTimeout(async () => {
+      try {
+        if (currentFrame >= frameCount - 1) {
+          playing = false;
+          updateControls();
+          return;
+        }
+        const nextFrame = currentFrame + 1;
+        await ensureFrame(nextFrame);
+        if (!playing || generation !== timerGeneration) return;
+        drawFrame(nextFrame);
+        warmAround(nextFrame);
+        if (currentFrame >= frameCount - 1) playing = false;
+        updateControls();
+        schedule();
+      } catch (error) {
+        // Leave the controls consistent with reality rather than showing
+        // "Pause" over a timer chain that has already ended.
+        playing = false;
+        stopTimer();
+        updateControls();
+        reportError("Playback", error);
+      }
+    }, intervalMs());
+  }
+
+  // An async listener that rejects is an unhandled rejection the user never
+  // sees, so route every one of them through the same reporting path.
+  const guard = (stage, handler) => async event => {
+    try {
+      await handler(event);
+    } catch (error) {
+      playing = false;
+      stopTimer();
+      updateControls();
+      reportError(stage, error);
+    }
+  };
+  toggle.addEventListener("click", guard("Playback", async () => {
+    if (!ready || frameCount <= 1) return;
+    if (playing) {
+      playing = false;
+      stopTimer();
+    } else {
+      if (currentFrame >= frameCount - 1) {
+        await ensureFrame(0);
+        drawFrame(0);
+      }
+      playing = true;
+      schedule();
+    }
+    updateControls();
+  }));
+  restart.addEventListener("click", guard("Restart", async () => {
+    playing = false;
+    stopTimer();
+    await ensureFrame(0);
+    drawFrame(0);
+    warmAround(0);
+  }));
+  speedControl.addEventListener("change", () => {
+    updateControls();
+    schedule();
+  });
+  timeline.addEventListener("input", guard("Seeking", async event => {
+    stopTimer();
+    const requestedFrame = Number(event.target.value);
+    await ensureFrame(requestedFrame);
+    if (Number(timeline.value) !== requestedFrame) return;
+    drawFrame(requestedFrame);
+    warmAround(requestedFrame);
+    schedule();
+  }));
+
+  skeletonCanvas.addEventListener("pointerdown", event => {
+    dragging = true;
+    lastPointer = [event.clientX, event.clientY];
+    skeletonCanvas.classList.add("dragging");
+    skeletonCanvas.setPointerCapture(event.pointerId);
+    tooltip.style.display = "none";
+  });
+  skeletonCanvas.addEventListener("pointermove", event => {
+    if (dragging) {
+      const dx = event.clientX - lastPointer[0];
+      const dy = event.clientY - lastPointer[1];
+      camera.yaw -= dx * 0.008;
+      camera.pitch = Math.max(-1.45, Math.min(1.45, camera.pitch + dy * 0.008));
+      lastPointer = [event.clientX, event.clientY];
+      saveCamera();
+      drawSkeleton();
+      return;
+    }
+    const bounds = skeletonCanvas.getBoundingClientRect();
+    const x = event.clientX - bounds.left;
+    const y = event.clientY - bounds.top;
+    const nearest = projectedJoints
+      .map(joint => ({joint, distance: Math.hypot(joint.x - x, joint.y - y)}))
+      .sort((a, b) => a.distance - b.distance)[0];
+    if (!nearest || nearest.distance > nearest.joint.radius + 5) {
+      tooltip.style.display = "none";
+      return;
+    }
+    tooltip.textContent = nearest.joint.label;
+    tooltip.style.left = `${x + 12}px`;
+    tooltip.style.top = `${y + 12}px`;
+    tooltip.style.display = "block";
+  });
+  skeletonCanvas.addEventListener("pointerup", event => {
+    dragging = false;
+    skeletonCanvas.classList.remove("dragging");
+    skeletonCanvas.releasePointerCapture(event.pointerId);
+    saveCamera();
+  });
+  skeletonCanvas.addEventListener("pointercancel", () => {
+    dragging = false;
+    skeletonCanvas.classList.remove("dragging");
+  });
+  skeletonCanvas.addEventListener("wheel", event => {
+    event.preventDefault();
+    camera.zoom = Math.max(0.55, Math.min(2.5, camera.zoom * Math.exp(-event.deltaY * 0.001)));
+    saveCamera();
+    drawSkeleton();
+  }, {passive: false});
+  document.getElementById("resetCamera").addEventListener("click", () => {
+    camera = {...defaultCamera};
+    saveCamera();
+    drawSkeleton();
+  });
+
+  new ResizeObserver(() => {
+    modalities.forEach(drawImage);
+    drawSkeleton();
+  }).observe(document.getElementById("player"));
+
+  drawFrame(0);
+  warmFrames(0, 4).then(() => {
+    ready = true;
+    toggle.disabled = frameCount <= 1;
+    const frameLabel = frameCount === 1 ? "1 synchronized frame" : `${frameCount} synchronized frames`;
+    loadStatus.textContent = Object.keys(model.imageAssets).length
+      ? `${frameLabel} ready`
+      : "No image streams available";
+    drawFrame(currentFrame);
+    trimImageCache(currentFrame);
+  }).catch(error => {
+    // This is the only path that enables Play; without a catch a failure here
+    // leaves the player disabled under a permanent "Loading clip frames…".
+    reportError("Loading clip frames", error);
+  });
+})();
+</script>
+"""
+    return template.replace("__MODEL__", model_json).replace("__PLOTLY__", plotly_javascript)
+
+
+def render_clip_player(
+    modalities: dict[str, list[str]],
+    source_data: dict[str, str],
+    static_payloads: Mapping[str, bytes],
+    skeleton_ranges: SkeletonAxisRanges | None,
+    skeleton_bone_lengths: SkeletonBoneLengths | None,
+    playback_identity: str,
+    duration_seconds: object,
+) -> None:
+    with st.spinner("Preparing smooth playback…"):
+        frame_count = timeline_frame_count(modalities)
+        selections = _timeline_selections(modalities, frame_count)
+        image_paths = _selected_paths(selections, ("Depth_Color", "IR", "Thermal"))
+        skeleton_paths = _selected_paths(selections, ("Skeleton",))
+        if image_paths:
+            image_assets, (max_edge, quality) = cached_image_assets(source_data, image_paths)
         else:
-            st.info("Skeleton unavailable.")
-    with radar_column:
-        st.subheader("Radar point cloud")
-        if radar_paths:
-            figure, selected_frame, total_frames = radar_figure(payloads[radar_paths[0]], position)
-            if figure is not None:
-                st.plotly_chart(figure, width="stretch")
-                st.caption(f"Radar frame {selected_frame}; {total_frames} frames contain detections.")
-            else:
-                st.info("The radar file exists but contains no detections.")
-        else:
-            st.info("Radar unavailable.")
+            image_assets, (max_edge, quality) = {}, _image_encoding(0)
+        skeleton_payloads = cached_payloads(source_data, skeleton_paths) if skeleton_paths else {}
+        radar_paths = modalities.get("Radar", [])
+        radar_payload = static_payloads.get(radar_paths[0]) if radar_paths else None
+        intervals_ms = {
+            f"{speed:g}": round(playback_interval(duration_seconds, frame_count, speed) * 1000)
+            for speed in (0.5, 1.0, 2.0)
+        }
+        model = _clip_player_model(
+            selections,
+            image_assets,
+            skeleton_payloads,
+            radar_payload,
+            skeleton_ranges,
+            skeleton_bone_lengths,
+            playback_identity,
+            intervals_ms,
+        )
+        player_html = _clip_player_html(model)
+
+    # The whole clip travels to the browser in one document, so make its size
+    # visible rather than letting a long clip quietly stall the connection.
+    if hasattr(st, "iframe"):
+        st.iframe(player_html, width="stretch", height=CLIP_PLAYER_HEIGHT, tab_index=0)
+    else:  # pragma: no cover - compatibility with Streamlit before 1.62
+        components.html(player_html, height=CLIP_PLAYER_HEIGHT, scrolling=True)
+    # The document is almost entirely base64, so its character count is within a
+    # rounding error of its byte count and avoids copying several megabytes.
+    payload_bytes = len(player_html)
+    frame_label = "frame" if frame_count == 1 else "frames"
+    st.caption(
+        f"{frame_count:,} {frame_label} preloaded · {len(image_assets):,} images at "
+        f"{max_edge}px/q{quality} · {payload_bytes / 1_048_576:.1f} MiB sent to the browser"
+    )
+    if payload_bytes > CLIP_PLAYER_IMAGE_BUDGET:
+        st.warning(
+            f"This clip's player is {payload_bytes / 1_048_576:.0f} MiB. Long clips can be slow "
+            "to load or exceed the Streamlit websocket message limit "
+            "(`server.maxMessageSize`)."
+        )
 
 
 def render_clip_explorer(frame: pd.DataFrame, sources: dict[str, dict[str, str]]) -> None:
@@ -1473,83 +1925,16 @@ def render_clip_explorer(frame: pd.DataFrame, sources: dict[str, dict[str, str]]
     else:
         skeleton_ranges, skeleton_bone_lengths = None, None
 
-    frame_count = timeline_frame_count(modalities)
     playback_identity = f"{split}:{clip_id}"
-    frame_key = f"playback_frame:{playback_identity}"
-    if st.session_state.get("playback_identity") != playback_identity:
-        st.session_state.playback_identity = playback_identity
-        st.session_state.playback_running = False
-        st.session_state.playback_hold_tick = False
-        st.session_state[frame_key] = 0
-    if "playback_speed" not in st.session_state:
-        st.session_state.playback_speed = 1.0
-
-    controls = st.columns((1, 1, 1.5, 5))
-    running = bool(st.session_state.get("playback_running", False))
-    current_frame = min(int(st.session_state.get(frame_key, 0)), frame_count - 1)
-    # A single-frame clip is always "at the end", but it has never been played,
-    # so offering Replay rather than Play would be misleading.
-    finished = frame_count > 1 and current_frame >= frame_count - 1
-    toggle_label = "⏸ Pause" if running else ("↻ Replay" if finished else "▶ Play")
-    # Render the persistent widget before a button handler can call st.rerun().
-    # Otherwise Streamlit's widget cleanup drops its state during that partial
-    # pass and the next run recreates the speed at the default 1× value.
-    speed = controls[2].select_slider(
-        "Speed",
-        options=(0.5, 1.0, 2.0),
-        format_func=lambda value: f"{value:g}×",
-        key="playback_speed",
+    render_clip_player(
+        modalities,
+        source_data,
+        static_payloads,
+        skeleton_ranges,
+        skeleton_bone_lengths,
+        playback_identity,
+        row.get("duration_seconds"),
     )
-    if controls[0].button(toggle_label, key=f"playback_toggle:{playback_identity}", width="stretch"):
-        if not running:
-            st.session_state[frame_key] = playback_start_frame(current_frame, frame_count)
-        st.session_state.playback_running = not running
-        st.session_state.playback_hold_tick = not running
-        st.rerun()
-    if controls[1].button("↺ Restart", key=f"playback_restart:{playback_identity}", width="stretch"):
-        st.session_state[frame_key] = 0
-        st.session_state.playback_running = False
-        st.session_state.playback_hold_tick = False
-        st.rerun()
-    interval = playback_interval(row.get("duration_seconds"), frame_count, float(speed)) if running else None
-
-    @st.fragment(run_every=interval)
-    def playback_fragment() -> None:
-        current = min(int(st.session_state.get(frame_key, 0)), frame_count - 1)
-        if st.session_state.get("playback_running", False):
-            if st.session_state.get("playback_hold_tick", False):
-                st.session_state.playback_hold_tick = False
-            elif current < frame_count - 1:
-                current += 1
-                st.session_state[frame_key] = current
-            else:
-                st.session_state.playback_running = False
-                st.rerun()
-
-        def hold_after_seek() -> None:
-            st.session_state.playback_hold_tick = True
-
-        current = st.slider(
-            "Timeline frame",
-            min_value=0,
-            max_value=frame_count - 1,
-            key=frame_key,
-            on_change=hold_after_seek,
-            help="Drag to scrub manually; Play advances this timeline automatically.",
-        )
-        position = normalized_timeline_position(current, frame_count)
-        st.caption(f"Frame {current + 1} of {frame_count} · {position}% through clip · {float(speed):g}×")
-        render_visual_frame(
-            modalities,
-            source_data,
-            static_payloads,
-            skeleton_ranges,
-            skeleton_bone_lengths,
-            playback_identity,
-            position,
-        )
-
-    playback_fragment()
 
     st.subheader("IMU magnitude traces")
     if imu_paths:

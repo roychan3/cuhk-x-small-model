@@ -123,7 +123,8 @@ This repository includes a Streamlit dashboard with:
 
 - class balance, user/action coverage, modality availability, and clip-length plots;
 - synchronized Depth Color, IR, and Thermal frames with play, pause, restart,
-  speed, and manual scrubbing controls;
+  speed, and manual scrubbing controls; playback stays in one browser component
+  so advancing a frame does not remount the images or 3D viewers;
 - animated 3D skeletons, IMU magnitude traces, and radar point clouds;
 - **Generate predictions** directly from any saved `artifacts/*/model.joblib` for **both training and test splits** with a live progress bar (`Extracting training features: X/2,785 → Extracting test features: X/405`), plus `path,prediction` CSV upload/auto-discovery; training predictions are visualized via accuracy, true-vs-predicted confusion matrix, predicted/true distributions and per-clip ✓/✗, test predictions via coverage/distribution/table; `Clip explorer` shows predicted vs true with correctness filters;
 - missing-modality, empty-sensor, and timestamp-alignment diagnostics;
@@ -277,12 +278,12 @@ There are six suites with different requirements:
 | `tests/test_visualization_dataset.py` | 16 | standard library only | always runs |
 | `tests/test_predictions.py` | 7 | standard library only | always runs |
 | `tests/test_comparison_format.py` | 13 | standard library only | always runs; its 2 CLI-parity tests skip without `modeling/requirements.txt` |
-| `tests/test_model_predictions.py` | 31 | artifact discovery and CSV round-tripping need the standard library only; the rest need `numpy`, `visualization/requirements.txt` (for `visualization.app`), or `modeling/requirements.txt` | 5 tests always run; the other 26 skip. Dataset I/O is mocked throughout, so no suite needs the dataset |
+| `tests/test_model_predictions.py` | 36 | artifact discovery and CSV round-tripping need the standard library only; the rest need `numpy`, `visualization/requirements.txt` (for `visualization.app`), or `modeling/requirements.txt` | 5 tests always run; the other 31 skip. Dataset I/O is mocked throughout, so no suite needs the dataset |
 | `tests/test_algorithm_comparison.py` | 16 | `visualization/requirements.txt` + `numpy` (for confusion-matrix math) | collapses to 1 skip |
 | `tests/test_modeling.py` | 26 | `modeling/requirements.txt` | collapses to 1 skip |
 
-So a bare interpreter reports `Ran 69 tests ... OK (skipped=30)`, while an
-interpreter with `visualization` + `modeling` deps reports `Ran 109 tests ... OK`
+So a bare interpreter reports `Ran 74 tests ... OK (skipped=35)`, while an
+interpreter with `visualization` + `modeling` deps reports `Ran 114 tests ... OK`
 (`skipped=1` when the optional real validation artifact is absent). A skip is
 expected, not a failure. Install the extras to run
 everything:

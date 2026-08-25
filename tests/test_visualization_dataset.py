@@ -24,10 +24,9 @@ from visualization.dataset import (
     write_manifest,
 )
 from visualization.playback import (
-    normalized_timeline_position,
     playback_interval,
-    playback_start_frame,
     timeline_frame_count,
+    timeline_member_index,
 )
 
 
@@ -38,16 +37,14 @@ class DatasetParsingTests(unittest.TestCase):
             "Thermal": [f"thermal-{index}" for index in range(8)],
         }
         self.assertEqual(timeline_frame_count(modalities), 3)
-        self.assertEqual(normalized_timeline_position(1, 3), 50)
-        self.assertEqual(normalized_timeline_position(0, 1), 0)
         self.assertAlmostEqual(playback_interval(2.0, 3, 1.0), 1.0)
         self.assertAlmostEqual(playback_interval(2.0, 3, 2.0), 0.5)
 
-    def test_playback_resumes_mid_clip_but_restarts_after_completion(self) -> None:
-        self.assertEqual(playback_start_frame(3, 10), 3)
-        self.assertEqual(playback_start_frame(9, 10), 0)
-        self.assertEqual(playback_start_frame(12, 10), 0)
-        self.assertEqual(playback_start_frame(0, 1), 0)
+    def test_timeline_member_mapping_does_not_quantize_through_percent(self) -> None:
+        self.assertEqual(timeline_member_index(567, 1001, 1001), 567)
+        self.assertEqual(timeline_member_index(4, 9, 26), 12)
+        self.assertEqual(timeline_member_index(20, 9, 3), 2)
+        self.assertEqual(timeline_member_index(0, 1, 0), 0)
 
     def test_parse_training_member(self) -> None:
         source = DataSource("train", "zip", "/tmp/HAR_full.zip")

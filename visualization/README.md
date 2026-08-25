@@ -9,7 +9,26 @@ dataset and comparing training algorithms.
 - `algorithm_comparison.py`: Algorithm comparison page (reads `artifacts/*/validation.json` from `modeling.train`/`modeling.compare`; no `scikit-learn` needed).
 - `comparison_format.py`: standard-library-only definition of the comparison table (columns, row builder, run labels), shared with `modeling/compare.py` so the page and the CLI cannot drift.
 - `predictions.py`: standard-library prediction CSV validation, clip-ID normalization, action-name mapping, plus `discover_model_artifacts`, `generate_predictions_from_model`, `generate_all_split_predictions` and `save_prediction_csv` for in-UI model inference on both train/test splits with an optional `progress_callback`.
-- `playback.py`: synchronized timeline and playback timing helpers.
+- `playback.py`: synchronized timeline and playback timing helpers. The clip
+  player preloads browser-sized frame assets and advances them client-side, so
+  Streamlit does not rebuild the visual tree on every frame.
+
+### Clip player payload
+
+The whole clip travels to the browser in one document, so its size grows with
+clip length rather than with what is on screen. Frames are re-encoded as JPEG
+and the resize bound tightens as the frame count rises (`IMAGE_ENCODING_STEPS`
+in `app.py`: 640px/q82 for short clips down to 320px/q64 for the longest).
+Only the encoded payload is cached — reading through `cached_image_assets`
+rather than `cached_payloads` keeps the original frame bytes transient, so an
+opened clip is not held twice. A caption under the player reports the frame
+count, encoding and transferred size, and a clip over 24 MiB warns that it may
+approach Streamlit's `server.maxMessageSize`.
+
+Radar clips additionally inline `plotly.js` (a few MiB, escaped and cached
+once per process via `_plotly_script`). The player scrolls internally, because
+the host iframe is a fixed height while the layout reflows with viewport width
+and `st.iframe` has no scrolling parameter.
 - `dataset.py`: standard-library dataset discovery, indexing, quality checks, archive access, and manifest generation.
 - `build_manifest.py`: command-line manifest generator.
 - `requirements.txt`: visualization-only Python dependencies.

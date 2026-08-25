@@ -15,18 +15,13 @@ def timeline_frame_count(modalities: dict[str, list[str]]) -> int:
     return max(1, frame_count)
 
 
-def normalized_timeline_position(frame_index: int, frame_count: int) -> int:
-    if frame_count <= 1:
+def timeline_member_index(frame_index: int, frame_count: int, member_count: int) -> int:
+    """Map one timeline frame directly to a modality member without percent quantization."""
+
+    if frame_count <= 1 or member_count <= 1:
         return 0
-    return round(100 * frame_index / (frame_count - 1))
-
-
-def playback_start_frame(frame_index: int, frame_count: int) -> int:
-    """Resume within a clip, but restart when playback is already complete."""
-
-    last_frame = max(0, frame_count - 1)
-    current = max(0, min(int(frame_index), last_frame))
-    return 0 if current >= last_frame else current
+    current = max(0, min(int(frame_index), frame_count - 1))
+    return round((member_count - 1) * current / (frame_count - 1))
 
 
 def playback_interval(duration_seconds: object, frame_count: int, speed: float) -> float:

@@ -9,7 +9,9 @@ test_modeling.
 
 from __future__ import annotations
 
+import base64
 import csv
+import io
 import json
 import math
 import tempfile
@@ -43,16 +45,21 @@ try:
     from visualization.app import (
         SKELETON_EDGES,
         SKELETON_JOINT_NAMES,
+        IMAGE_ENCODING_STEPS,
+        _clip_player_html,
+        _clip_player_model,
+        _image_data_uri,
+        _image_encoding,
         _skeleton_edge_chain,
+        _selected_paths,
+        _skeleton_people,
         _stabilize_skeleton_points,
-        _skeleton_viewer_html,
+        _timeline_selections,
         add_predictions,
         add_split_predictions,
         correctness_flag,
         merge_prediction_sources,
-        skeleton_axis_ranges,
         skeleton_calibration,
-        skeleton_figure,
     )
 
     HAS_APP_DEPS = True
@@ -75,43 +82,7 @@ needs_modeling = unittest.skipUnless(HAS_MODELING, "needs modeling/requirements.
 
 
 @needs_app
-class SkeletonFigureTests(unittest.TestCase):
-    def test_uses_h36m_connections_and_equal_axis_scale(self) -> None:
-        keypoints = [[float(index), float(index % 3), float(index * 2)] for index in range(17)]
-        payload = json.dumps([{"keypoints": keypoints, "keypoint_scores": [1.0] * 17}]).encode()
-
-        figure = skeleton_figure(payload, uirevision="test-clip")
-
-        self.assertIsNotNone(figure)
-        assert figure is not None
-        self.assertEqual(
-            SKELETON_EDGES,
-            (
-                (0, 1), (1, 2), (2, 3),
-                (0, 4), (4, 5), (5, 6),
-                (0, 7), (7, 8), (8, 9), (9, 10),
-                (8, 11), (11, 12), (12, 13),
-                (8, 14), (14, 15), (15, 16),
-            ),
-        )
-        bones, joints = figure.data
-        self.assertEqual(
-            list(zip(bones.x[::3], bones.x[1::3])),
-            [(keypoints[start][0], keypoints[end][0]) for start, end in SKELETON_EDGES],
-        )
-        self.assertTrue(joints.text[0].startswith("Pelvis<br>"))
-
-        scene = figure.layout.scene
-        spans = [axis.range[1] - axis.range[0] for axis in (scene.xaxis, scene.yaxis, scene.zaxis)]
-        self.assertAlmostEqual(spans[0], spans[1])
-        self.assertAlmostEqual(spans[1], spans[2])
-        self.assertEqual(scene.camera.up.z, 1)
-        self.assertEqual(scene.camera.eye.x, 0)
-        self.assertGreater(scene.camera.eye.y, 0)
-        self.assertEqual(scene.camera.eye.z, 0)
-        self.assertEqual(figure.layout.uirevision, "test-clip")
-        self.assertEqual(scene.uirevision, "test-clip")
-
+class SkeletonPlaybackTests(unittest.TestCase):
     def test_clip_ranges_keep_scale_fixed_between_frames(self) -> None:
         first_points = [[float(index), 0.0, float(index * 2)] for index in range(17)]
         second_points = [[float(index * 2), 0.5, float(index)] for index in range(17)]
@@ -120,32 +91,153 @@ class SkeletonFigureTests(unittest.TestCase):
             for points in (first_points, second_points)
         ]
 
-        axis_ranges = skeleton_axis_ranges(payloads)
-        first_figure = skeleton_figure(payloads[0], axis_ranges)
-        second_figure = skeleton_figure(payloads[1], axis_ranges)
+        axis_ranges, bone_lengths = skeleton_calibration(payloads)
+        self.assertIsNotNone(axis_ranges)
+        self.assertIsNotNone(bone_lengths)
+        assert axis_ranges is not None
+        spans = [high - low for low, high in axis_ranges]
+        self.assertAlmostEqual(spans[0], spans[1])
+        self.assertAlmostEqual(spans[1], spans[2])
 
-        self.assertIsNotNone(first_figure)
-        self.assertIsNotNone(second_figure)
-        assert first_figure is not None and second_figure is not None
-        first_scene = first_figure.layout.scene
-        second_scene = second_figure.layout.scene
-        for first_axis, second_axis in zip(
-            (first_scene.xaxis, first_scene.yaxis, first_scene.zaxis),
-            (second_scene.xaxis, second_scene.yaxis, second_scene.zaxis),
-        ):
-            self.assertEqual(first_axis.range, second_axis.range)
+    def test_clip_player_preloads_frames_for_in_place_browser_playback(self) -> None:
+        selections = _timeline_selections(
+            {
+                "Depth_Color": ["depth-0.png", "depth-1.png"],
+                "IR": ["ir.png"],
+                "Skeleton": [],
+            },
+            2,
+        )
+        self.assertEqual(
+            _selected_paths(selections, ("Depth_Color", "IR", "Thermal")),
+            ("depth-0.png", "ir.png", "depth-1.png"),
+        )
+        # A modality shorter than the timeline repeats rather than running out.
+        self.assertEqual([s["IR"] for s in selections], ["ir.png", "ir.png"])
+        self.assertEqual(_selected_paths(selections, ("Skeleton",)), ())
+        model = _clip_player_model(
+            selections,
+            {"depth-0.png": "data:image/jpeg;base64,AAA", "depth-1.png": "data:image/jpeg;base64,BBB"},
+            {},
+            b"frame,x,y,z,v,snr\n7,1,2,3,-0.5,60\n",
+            None,
+            None,
+            "test:clip-1",
+            {"0.5": 200, "1": 100, "2": 50},
+        )
 
-    def test_viewer_preserves_camera_and_embeds_each_frame(self) -> None:
+        self.assertEqual(len(model["frames"]), 2)
+        # ir.png had no asset, so the frame still names it but the player skips it.
+        self.assertEqual(sorted(model["imageAssets"]), ["depth-0.png", "depth-1.png"])
+        self.assertEqual(model["frames"][0]["images"]["IR"], "ir.png")
+        self.assertEqual(model["radarFrames"][0]["frame"], 7)
+        self.assertEqual(model["intervalsMs"]["2"], 50)
+
+    def test_repeated_skeleton_path_is_parsed_once_per_clip(self) -> None:
+        """A short pose stream maps many timeline frames onto one file."""
+
         points = [[float(index), 0.0, float(index * 2)] for index in range(17)]
         payload = json.dumps([{"keypoints": points, "keypoint_scores": [1.0] * 17}]).encode()
-        html = _skeleton_viewer_html(payload, None, None, "test:clip-1")
+        selections = [{"Skeleton": "pose.json"} for _ in range(4)]
 
-        self.assertIsNotNone(html)
-        assert html is not None
+        with patch("visualization.app._skeleton_people", wraps=_skeleton_people) as parsed:
+            model = _clip_player_model(
+                selections, {}, {"pose.json": payload}, None, None, None, "test:clip-1", {}
+            )
+
+        self.assertEqual(parsed.call_count, 1)
+        self.assertEqual(len(model["frames"]), 4)
+        # Every frame shares the one parsed pose rather than a private copy.
+        first = model["frames"][0]["skeleton"]
+        self.assertTrue(all(frame["skeleton"] is first for frame in model["frames"]))
+
+    def test_clip_player_updates_mounted_elements_instead_of_rerunning_streamlit(self) -> None:
+        model = _clip_player_model(
+            [{"Depth_Color": None, "IR": None, "Thermal": None, "Skeleton": None}],
+            {},
+            {},
+            None,
+            None,
+            None,
+            "test:clip-1",
+            {"0.5": 200, "1": 100, "2": 50},
+        )
+
+        html = _clip_player_html(model)
+
+        self.assertIn("const imageCache = new Map()", html)
+        self.assertIn("window.setTimeout", html)
+        self.assertIn("drawFrame(nextFrame)", html)
         self.assertIn("pointermove", html)
         self.assertIn("sessionStorage", html)
-        self.assertIn("cuhkx:skeleton-camera:test:clip-1", html)
-        self.assertIn('"points":[[0.0,0.0,0.0]', html)
+        self.assertIn("cuhkx:skeleton-camera:${model.identity}", html)
+        # The host iframe is a fixed height, so the player must scroll itself.
+        self.assertIn("overflow-y: auto", html)
+        # Without radar the multi-megabyte plotly bundle stays out of the page.
+        self.assertLess(len(html), 200_000)
+
+    def test_plotly_is_inlined_only_when_the_clip_has_radar(self) -> None:
+        common = ([{"Depth_Color": None, "IR": None, "Thermal": None, "Skeleton": None}], {}, {})
+        without = _clip_player_html(
+            _clip_player_model(*common, None, None, None, "test:clip-1", {})
+        )
+        with_radar = _clip_player_html(
+            _clip_player_model(
+                *common, b"frame,x,y,z,v,snr\n7,1,2,3,-0.5,60\n", None, None, "test:clip-1", {}
+            )
+        )
+
+        self.assertGreater(len(with_radar), len(without) + 500_000)
+        # The bundle must not close the script element that wraps it, or the
+        # rest of the player would be parsed as markup.
+        self.assertEqual(with_radar.count("</script>"), without.count("</script>"))
+
+    def test_image_encoding_shrinks_frames_as_clips_get_longer(self) -> None:
+        self.assertEqual(_image_encoding(1), IMAGE_ENCODING_STEPS[0])
+        self.assertEqual(_image_encoding(10_000), IMAGE_ENCODING_STEPS[-1])
+        edges = [_image_encoding(count)[0] for count in (1, 200, 800, 5_000)]
+        self.assertEqual(edges, sorted(edges, reverse=True))
+
+    def test_frames_are_reencoded_and_the_resize_bound_binds(self) -> None:
+        """The production path re-encodes; the fallback keeps the original bytes.
+
+        Depth Color and IR are already 640x480, so the first encoding step only
+        changes the format. The later steps have to actually shrink the pixels,
+        which is what keeps a long clip's payload bounded.
+        """
+
+        from PIL import Image
+
+        buffer = io.BytesIO()
+        Image.frombytes(
+            "RGB",
+            (640, 480),
+            bytes((index // 3) % 256 for index in range(640 * 480 * 3)),
+        ).save(buffer, format="PNG")
+        original = buffer.getvalue()
+
+        def decoded(uri: str | None) -> Image.Image:
+            assert uri is not None
+            self.assertTrue(uri.startswith("data:image/jpeg;base64,"))
+            return Image.open(io.BytesIO(base64.b64decode(uri.split(",", 1)[1])))
+
+        full = _image_data_uri("frame.png", original, 640, 82)
+        self.assertEqual(decoded(full).size, (640, 480))
+
+        for max_edge, quality in IMAGE_ENCODING_STEPS[1:]:
+            reduced = _image_data_uri("frame.png", original, max_edge, quality)
+            self.assertLessEqual(max(decoded(reduced).size), max_edge)
+            assert reduced is not None and full is not None
+            self.assertLess(len(reduced), len(full))
+
+    def test_undecodable_frames_fall_back_only_for_browser_formats(self) -> None:
+        self.assertTrue(
+            (_image_data_uri("frame.png", b"not an image", 640, 82) or "").startswith(
+                "data:image/png;base64,"
+            )
+        )
+        # An unknown suffix would embed a URI no browser can render.
+        self.assertIsNone(_image_data_uri("frame.raw", b"not an image", 640, 82))
 
     def test_clip_median_lengths_stabilize_each_frame(self) -> None:
         first_points = [[float(index), 0.0, float(index * 2)] for index in range(17)]
@@ -190,6 +282,16 @@ class SkeletonFigureTests(unittest.TestCase):
             self.assertAlmostEqual(math.dist(original, rebuilt), 0.0, places=6)
 
     def test_edge_chain_is_a_tree_rooted_at_the_pelvis(self) -> None:
+        self.assertEqual(
+            SKELETON_EDGES,
+            (
+                (0, 1), (1, 2), (2, 3),
+                (0, 4), (4, 5), (5, 6),
+                (0, 7), (7, 8), (8, 9), (9, 10),
+                (8, 11), (11, 12), (12, 13),
+                (8, 14), (14, 15), (15, 16),
+            ),
+        )
         chain = _skeleton_edge_chain(SKELETON_EDGES)
         self.assertEqual(len(chain), len(SKELETON_EDGES))
         placed = {0}
