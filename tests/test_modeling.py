@@ -17,6 +17,7 @@ try:
     from modeling.data import EXPECTED_IMU_DEVICES, discover_training_clips
     from modeling.model import (
         FittedMultimodalModel,
+        feature_config_from_artifact,
         _majority_vote,
         cross_validate_detailed,
         library_versions,
@@ -25,8 +26,21 @@ try:
         save_validation_outputs,
     )
     from modeling.features import (
+        HEAD,
+        L_ANKLE,
+        L_HIP,
+        L_SHOULDER,
+        L_WRIST,
+        PELVIS,
+        R_ANKLE,
+        R_HIP,
+        R_SHOULDER,
+        R_WRIST,
+        SKELETON_JOINTS,
+        THORAX,
         FeatureConfig,
         RawFeatureBundle,
+        feature_config_dict,
         extract_image_feature_pair,
         extract_image_features,
         extract_imu_feature_pair,
@@ -98,12 +112,40 @@ def write_imu(path: Path, devices: tuple[str, ...]) -> None:
             )
 
 
-def skeleton_person(offset: float) -> dict[str, object]:
-    points = [[offset + joint * 0.01, joint * 0.02, 1.0 + joint * 0.01] for joint in range(17)]
-    points[5] = [offset - 0.2, 0.5, 1.0]
-    points[6] = [offset + 0.2, 0.5, 1.0]
-    points[11] = [offset - 0.1, 0.0, 1.0]
-    points[12] = [offset + 0.1, 0.0, 1.0]
+def skeleton_person(offset: float, wrists_at_head: bool = False) -> dict[str, object]:
+    """An anatomically plausible Human3.6M pose, standing and facing +y.
+
+    The hips are deliberately asymmetric about the pelvis so that centring on
+    joint 0 and centring on the hip midpoint give different answers; a
+    symmetric fixture passes either way and pins nothing.
+    """
+
+    points = [[0.0, 0.0, 0.0] for _ in range(17)]
+    points[0] = [0.00, 0.0, 0.50]  # Pelvis
+    points[1] = [0.12, 0.0, 0.50]  # Right hip  (asymmetric on purpose)
+    points[2] = [0.12, 0.0, 0.28]  # Right knee
+    points[3] = [0.12, 0.0, 0.05]  # Right ankle
+    points[4] = [-0.08, 0.0, 0.50]  # Left hip
+    points[5] = [-0.08, 0.0, 0.28]  # Left knee
+    points[6] = [-0.08, 0.0, 0.05]  # Left ankle
+    points[7] = [0.00, 0.0, 0.70]  # Spine
+    points[8] = [0.00, 0.0, 0.90]  # Thorax
+    points[9] = [0.00, 0.0, 1.00]  # Neck
+    points[10] = [0.00, 0.0, 1.15]  # Head
+    points[11] = [-0.18, 0.0, 0.90]  # Left shoulder
+    points[12] = [-0.20, 0.0, 0.68]  # Left elbow
+    points[13] = [-0.22, 0.0, 0.46]  # Left wrist
+    points[14] = [0.18, 0.0, 0.90]  # Right shoulder
+    points[15] = [0.20, 0.0, 0.68]  # Right elbow
+    points[16] = [0.22, 0.0, 0.46]  # Right wrist
+    if wrists_at_head:
+        # Both hands raised to the face, as in Wash_face or Brush_teeth.
+        points[12] = [-0.16, 0.10, 1.00]
+        points[13] = [-0.05, 0.06, 1.13]
+        points[15] = [0.16, 0.10, 1.00]
+        points[16] = [0.05, 0.06, 1.13]
+    for point in points:
+        point[0] += offset
     return {"keypoints": points, "keypoint_scores": [1.0] * 17}
 
 
@@ -185,8 +227,12 @@ class FeatureExtractionTests(unittest.TestCase):
             features = extract_skeleton_features(directory.parent, config)
         self.assertEqual(features.shape, (skeleton_feature_size(config),))
         positions = features[: config.skeleton_frames * 17 * 3].reshape(config.skeleton_frames, 17, 3)
-        roots = (positions[:, 11] + positions[:, 12]) / 2.0
-        np.testing.assert_allclose(roots, 0.0, atol=1e-5)
+        # Joint 0 is the Human3.6M root, so it lands on the origin. The hip
+        # midpoint must not, or the fixture would pass under the old COCO
+        # indexing that treated joints 11 and 12 as the hips.
+        np.testing.assert_allclose(positions[:, PELVIS], 0.0, atol=1e-5)
+        hip_midpoints = (positions[:, L_HIP] + positions[:, R_HIP]) / 2.0
+        self.assertGreater(float(np.abs(hip_midpoints).max()), 1e-3)
 
     def test_skeleton_engineered_features_have_fixed_size(self) -> None:
         config = FeatureConfig(skeleton_frames=4)
@@ -202,6 +248,49 @@ class FeatureExtractionTests(unittest.TestCase):
         self.assertEqual(base.shape, (skeleton_feature_size(config),))
         self.assertEqual(engineered.shape, (skeleton_engineered_feature_size(config),))
         self.assertTrue(np.isfinite(engineered).all())
+
+    def _engineered(self, wrists_at_head: bool) -> np.ndarray:
+        config = FeatureConfig(skeleton_frames=4)
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / "predictions"
+            directory.mkdir(parents=True)
+            for index in range(5):
+                payload = [skeleton_person(float(index) * 0.1, wrists_at_head=wrists_at_head)]
+                (directory / f"Color_2025-01-01_00-00-0{index}.000_{index}.json").write_text(
+                    json.dumps(payload), encoding="utf-8"
+                )
+            return extract_skeleton_feature_pair(directory.parent, config)[1]
+
+    def test_hand_to_head_distance_responds_to_raising_the_hands(self) -> None:
+        """Pins the joint indices to their anatomical meaning.
+
+        Under the previous COCO indexing this pair resolved to neck-to-pelvis,
+        a near-rigid trunk length that barely moves when the hands do, so the
+        two poses produced almost identical features.
+        """
+
+        config = FeatureConfig(skeleton_frames=4)
+        signal_size = 10 + config.temporal_bins * 2
+        # geometry order: 8 angles, then the 7 distance pairs.
+        start = (8 + 0) * signal_size
+        lowered = self._engineered(False)[start : start + signal_size]
+        raised = self._engineered(True)[start : start + signal_size]
+
+        # Channel 0 of _signal_features is the mean of the signal.
+        self.assertGreater(float(lowered[0]), 2.0 * float(raised[0]))
+
+    def test_joint_constants_match_the_dataset_layout(self) -> None:
+        points = np.asarray(skeleton_person(0.0)["keypoints"], dtype=np.float32)
+        # Head highest, ankles lowest, pelvis between the two.
+        self.assertEqual(int(np.argmax(points[:, 2])), HEAD)
+        self.assertIn(int(np.argmin(points[:, 2])), (L_ANKLE, R_ANKLE))
+        self.assertLess(points[L_ANKLE][2], points[PELVIS][2])
+        self.assertLess(points[PELVIS][2], points[THORAX][2])
+        self.assertLess(points[THORAX][2], points[HEAD][2])
+        # Left joints sit on the opposite side of the body from their mirror.
+        for left, right in ((L_HIP, R_HIP), (L_SHOULDER, R_SHOULDER), (L_WRIST, R_WRIST)):
+            self.assertLess(points[left][0], points[right][0])
+        self.assertEqual(SKELETON_JOINTS, len(points))
 
 
 class CompleteCaseDiscoveryTests(unittest.TestCase):
@@ -414,6 +503,46 @@ class CrossValidationOutputTests(unittest.TestCase):
                 np.testing.assert_array_equal(saved["clip_ids"], bundle.clip_ids)
                 np.testing.assert_array_equal(saved["labels"], labels)
                 self.assertEqual(saved["probabilities"].shape, (len(labels), 2))
+
+    def test_artifact_config_refuses_a_pre_h36m_model(self) -> None:
+        """Artifacts predating the skeleton fix must fail, not predict quietly.
+
+        Their skeleton columns were built by indexing Human3.6M poses as COCO,
+        so the current extractor produces something they were never fitted on.
+        """
+
+        model = FittedMultimodalModel(
+            reducers={},
+            combined_scaler=None,
+            classifier=None,
+            feature_config={"skeleton_frames": 32},
+            pca_components={},
+        )
+        with self.assertRaisesRegex(ValueError, "predates the skeleton joint-order"):
+            feature_config_from_artifact(model)
+
+    def test_artifact_config_round_trips_a_current_model(self) -> None:
+        config = FeatureConfig(skeleton_frames=8, temporal_bins=3)
+        model = FittedMultimodalModel(
+            reducers={},
+            combined_scaler=None,
+            classifier=None,
+            feature_config=feature_config_dict(config),
+            pca_components={},
+        )
+        self.assertEqual(feature_config_from_artifact(model), config)
+
+    def test_artifact_config_still_infers_the_legacy_ir_block(self) -> None:
+        values = feature_config_dict(FeatureConfig())
+        del values["include_legacy_ir"]
+        model = FittedMultimodalModel(
+            reducers={"ir": object()},
+            combined_scaler=None,
+            classifier=None,
+            feature_config=values,
+            pca_components={},
+        )
+        self.assertTrue(feature_config_from_artifact(model).include_legacy_ir)
 
     def test_majority_vote_does_not_always_break_ties_towards_the_low_class(self) -> None:
         # Two repeats that disagree on every clip: argmax would hand every clip

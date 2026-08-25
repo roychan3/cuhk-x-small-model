@@ -21,6 +21,14 @@ def normalized_timeline_position(frame_index: int, frame_count: int) -> int:
     return round(100 * frame_index / (frame_count - 1))
 
 
+def playback_start_frame(frame_index: int, frame_count: int) -> int:
+    """Resume within a clip, but restart when playback is already complete."""
+
+    last_frame = max(0, frame_count - 1)
+    current = max(0, min(int(frame_index), last_frame))
+    return 0 if current >= last_frame else current
+
+
 def playback_interval(duration_seconds: object, frame_count: int, speed: float) -> float:
     """Return a practical refresh interval that approximates recorded time."""
 

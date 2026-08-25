@@ -161,20 +161,26 @@ def discover_model_artifacts(repository_root: str | Path) -> list[Path]:
 def _require_modeling_stack() -> tuple[object, object, object, object, object]:
     """Import modeling helpers lazily; raise a clear error if unavailable.
 
-    Returns ``(discover_training_clips, discover_test_clips, FeatureConfig,
-    extract_feature_bundle, load_model)``.
+    Returns ``(discover_training_clips, discover_test_clips,
+    feature_config_from_artifact, extract_feature_bundle, load_model)``.
     """
 
     try:
         from modeling.data import discover_test_clips, discover_training_clips  # noqa: WPS433
-        from modeling.features import FeatureConfig, extract_feature_bundle  # noqa: WPS433
-        from modeling.model import load_model  # noqa: WPS433
+        from modeling.features import extract_feature_bundle  # noqa: WPS433
+        from modeling.model import feature_config_from_artifact, load_model  # noqa: WPS433
     except ImportError as exc:
         raise ImportError(
             "Generating predictions requires modeling/requirements.txt "
             f"(scikit-learn, numpy, Pillow, joblib). Install it first: {exc}"
         ) from exc
-    return discover_training_clips, discover_test_clips, FeatureConfig, extract_feature_bundle, load_model
+    return (
+        discover_training_clips,
+        discover_test_clips,
+        feature_config_from_artifact,
+        extract_feature_bundle,
+        load_model,
+    )
 
 
 def _prediction_table_from_arrays(
@@ -278,19 +284,20 @@ def generate_predictions_from_model(
     if split not in {"train", "test"}:
         raise ValueError(f"split must be 'train' or 'test', got {split!r}")
 
-    discover_training_clips, discover_test_clips, FeatureConfig, extract_feature_bundle, load_model = _require_modeling_stack()
+    (
+        discover_training_clips,
+        discover_test_clips,
+        feature_config_from_artifact,
+        extract_feature_bundle,
+        load_model,
+    ) = _require_modeling_stack()
 
     import os
 
     from visualization.dataset import resolve_dataset_root
 
     model = load_model(Path(model_path).expanduser())
-    # Rebuild the feature config from the saved model so old artifacts that
-    # used the legacy IR block keep working.
-    config_values = dict(model.feature_config)
-    if "include_legacy_ir" not in config_values:
-        config_values["include_legacy_ir"] = "ir" in model.reducers
-    config = FeatureConfig(**config_values)
+    config = feature_config_from_artifact(model)
 
     if action_mapping is None:
         # Resolve mapping from repository or dataset root.

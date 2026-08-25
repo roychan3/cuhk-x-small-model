@@ -10,7 +10,9 @@ import numpy as np
 from modeling.features import FeatureConfig, RawFeatureBundle, feature_config_dict
 
 
-CACHE_VERSION = 3
+# 4: skeleton features were reindexed from COCO to the Human3.6M joint order
+# the dataset actually uses, so every cached skeleton block from 3 is stale.
+CACHE_VERSION = 4
 
 
 def save_feature_cache(

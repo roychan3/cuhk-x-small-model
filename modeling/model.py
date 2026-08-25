@@ -546,6 +546,34 @@ def load_model(path: str | Path) -> FittedMultimodalModel:
     return model
 
 
+def feature_config_from_artifact(model: FittedMultimodalModel) -> FeatureConfig:
+    """Rebuild the extraction config a saved model was fitted against.
+
+    Shared by ``modeling.predict`` and the dashboard so the two cannot disagree
+    about how an artifact is interpreted.
+
+    Artifacts written before the skeleton joint order was corrected record no
+    ``skeleton_layout``. Their skeleton blocks were built by indexing
+    Human3.6M poses as if they were COCO, so the columns mean something
+    different than the current extractor produces. Feeding those models
+    today's features would silently return meaningless predictions rather
+    than fail, so refuse them instead.
+    """
+
+    config_values = dict(model.feature_config)
+    if "skeleton_layout" not in config_values:
+        raise ValueError(
+            "This model artifact predates the skeleton joint-order correction "
+            "(COCO indices applied to Human3.6M poses) and its skeleton features "
+            "are not comparable with the current extractor. Retrain it with "
+            "`python -m modeling.train` before predicting."
+        )
+    # Older artifacts that still carried the legacy IR block predate that flag.
+    if "include_legacy_ir" not in config_values:
+        config_values["include_legacy_ir"] = "ir" in model.reducers
+    return FeatureConfig(**config_values)
+
+
 def _warn_on_version_mismatch(model: FittedMultimodalModel, path: str | Path) -> None:
     """Warn when the artifact was written by different library versions.
 

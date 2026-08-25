@@ -24,6 +24,21 @@ _IMU_BASE_CHANNELS = 8
 _IMU_EXTENDED_CHANNELS = 18
 _DYNAMIC_FEATURES = 9
 
+# Skeleton predictions use the Human3.6M 17-joint order, NOT COCO. Verified
+# against the dataset over 1,314 frames from 80 clips: joint 0 sits at exactly
+# x == y == 0 in every frame (the root-relative pelvis), joint 10 is the
+# highest joint, and joints 3 and 6 are the lowest. Under COCO these indices
+# mean nose, right wrist, right ankle and left ankle instead, which turns
+# "wrist to head" into a near-rigid trunk length and inverts the torso vector.
+# Index these by name so the two orders cannot be confused again.
+PELVIS = 0
+R_HIP, R_KNEE, R_ANKLE = 1, 2, 3
+L_HIP, L_KNEE, L_ANKLE = 4, 5, 6
+SPINE, THORAX, NECK, HEAD = 7, 8, 9, 10
+L_SHOULDER, L_ELBOW, L_WRIST = 11, 12, 13
+R_SHOULDER, R_ELBOW, R_WRIST = 14, 15, 16
+SKELETON_JOINTS = 17
+
 
 @dataclass(frozen=True)
 class FeatureConfig:
@@ -38,6 +53,11 @@ class FeatureConfig:
     hog_orientations: int = 9
     hog_pixels_per_cell: tuple[int, int] = (8, 8)
     hog_cells_per_block: tuple[int, int] = (2, 2)
+    # Recorded so an artifact says which joint order its skeleton features were
+    # built from. Artifacts written before the COCO-to-H36M correction have no
+    # value here, and their skeleton blocks mean something different, so the
+    # prediction entry points refuse them rather than silently mixing the two.
+    skeleton_layout: str = "h36m"
 
 
 @dataclass(frozen=True)
@@ -740,11 +760,13 @@ def _valid_people(payload: object) -> list[tuple[np.ndarray, np.ndarray]]:
         if not isinstance(person, dict):
             continue
         points = np.asarray(person.get("keypoints", []), dtype=np.float32)
-        if points.shape != (17, 3) or not np.isfinite(points).all():
+        if points.shape != (SKELETON_JOINTS, 3) or not np.isfinite(points).all():
             continue
-        scores = np.asarray(person.get("keypoint_scores", [1.0] * 17), dtype=np.float32)
-        if scores.shape != (17,):
-            scores = np.ones(17, dtype=np.float32)
+        scores = np.asarray(
+            person.get("keypoint_scores", [1.0] * SKELETON_JOINTS), dtype=np.float32
+        )
+        if scores.shape != (SKELETON_JOINTS,):
+            scores = np.ones(SKELETON_JOINTS, dtype=np.float32)
         result.append((points, scores))
     return result
 
@@ -788,13 +810,13 @@ def _resample(values: np.ndarray, length: int) -> np.ndarray:
 
 
 def skeleton_feature_size(config: FeatureConfig) -> int:
-    return config.skeleton_frames * (17 * 3 * 2 + 17)
+    return config.skeleton_frames * (SKELETON_JOINTS * 3 * 2 + SKELETON_JOINTS)
 
 
 def skeleton_engineered_feature_size(config: FeatureConfig) -> int:
     signal_size = 10 + config.temporal_bins * 2
     geometry_signals = 24
-    joint_motion = 17 * 4
+    joint_motion = SKELETON_JOINTS * 4
     selected_acceleration = 5 * 4
     confidence_and_count = 22
     periodic_signals = 7 * _DYNAMIC_FEATURES
@@ -827,28 +849,31 @@ def _skeleton_engineered_features(
     scale: float,
     config: FeatureConfig,
 ) -> np.ndarray:
-    points = resampled_pose.reshape(config.skeleton_frames, 17, 3)
+    points = resampled_pose.reshape(config.skeleton_frames, SKELETON_JOINTS, 3)
+    # Elbow, shoulder, hip and knee flexion, left and right.
     angle_triplets = (
-        (5, 7, 9),
-        (6, 8, 10),
-        (7, 5, 11),
-        (8, 6, 12),
-        (5, 11, 13),
-        (6, 12, 14),
-        (11, 13, 15),
-        (12, 14, 16),
+        (L_SHOULDER, L_ELBOW, L_WRIST),
+        (R_SHOULDER, R_ELBOW, R_WRIST),
+        (L_ELBOW, L_SHOULDER, L_HIP),
+        (R_ELBOW, R_SHOULDER, R_HIP),
+        (L_SHOULDER, L_HIP, L_KNEE),
+        (R_SHOULDER, R_HIP, R_KNEE),
+        (L_HIP, L_KNEE, L_ANKLE),
+        (R_HIP, R_KNEE, R_ANKLE),
     )
     angles = np.column_stack(
         [_joint_angle_cosine(points, *triplet) for triplet in angle_triplets]
     )
+    # Hand-to-head separates the face-directed actions (Wash_face, Brush_teeth,
+    # Drink_water); the rest carry stance width and arm extension.
     distance_pairs = (
-        (9, 0),
-        (10, 0),
-        (9, 10),
-        (15, 16),
-        (9, 11),
-        (10, 12),
-        (5, 6),
+        (L_WRIST, HEAD),
+        (R_WRIST, HEAD),
+        (L_WRIST, R_WRIST),
+        (L_ANKLE, R_ANKLE),
+        (L_WRIST, L_HIP),
+        (R_WRIST, R_HIP),
+        (L_SHOULDER, R_SHOULDER),
     )
     distances = np.column_stack(
         [
@@ -856,13 +881,13 @@ def _skeleton_engineered_features(
             for first, second in distance_pairs
         ]
     )
-    roots = (points[:, 11] + points[:, 12]) / 2.0
-    shoulder_centers = (points[:, 5] + points[:, 6]) / 2.0
+    roots = points[:, PELVIS]
+    shoulder_centers = (points[:, L_SHOULDER] + points[:, R_SHOULDER]) / 2.0
     torso = shoulder_centers - roots
     torso_unit = torso / np.maximum(np.linalg.norm(torso, axis=1)[:, None], 1e-8)
     extents = np.max(points, axis=1) - np.min(points, axis=1)
 
-    original_roots = (pose_array[:, 11] + pose_array[:, 12]) / 2.0
+    original_roots = pose_array[:, PELVIS]
     resampled_roots = _resample(original_roots, config.skeleton_frames)
     root_displacement = (resampled_roots - resampled_roots[:1]) / max(scale, 1e-6)
     geometry = np.concatenate(
@@ -888,7 +913,7 @@ def _skeleton_engineered_features(
 
     acceleration = np.diff(velocity, axis=0, prepend=velocity[:1])
     acceleration_norm = np.linalg.norm(acceleration, axis=2)
-    selected_joints = (0, 9, 10, 15, 16)
+    selected_joints = (HEAD, L_WRIST, R_WRIST, L_ANKLE, R_ANKLE)
     acceleration_summary = np.column_stack(
         (
             np.mean(acceleration_norm[:, selected_joints], axis=0),
@@ -916,10 +941,10 @@ def _skeleton_engineered_features(
         root_displacement[:, 0],
         root_displacement[:, 1],
         root_displacement[:, 2],
-        speed[:, 9],
-        speed[:, 10],
-        speed[:, 15],
-        speed[:, 16],
+        speed[:, L_WRIST],
+        speed[:, R_WRIST],
+        speed[:, L_ANKLE],
+        speed[:, R_ANKLE],
     ]
     features.extend(
         _dynamic_signal_features(signal, config.spectral_samples) for signal in periodic
@@ -949,8 +974,8 @@ def extract_skeleton_feature_pair(
         else:
             selected = _select_person(_valid_people(payload), previous_center)
         if selected is None:
-            poses.append(np.full((17, 3), np.nan, dtype=np.float32))
-            scores.append(np.full(17, np.nan, dtype=np.float32))
+            poses.append(np.full((SKELETON_JOINTS, 3), np.nan, dtype=np.float32))
+            scores.append(np.full(SKELETON_JOINTS, np.nan, dtype=np.float32))
             continue
         points, confidence = selected
         previous_center = np.mean(points, axis=0)
@@ -967,9 +992,11 @@ def extract_skeleton_feature_pair(
             np.full(skeleton_engineered_feature_size(config), np.nan, dtype=np.float32),
         )
 
-    pose_array = flat_pose.reshape(-1, 17, 3)
-    roots = (pose_array[:, 11] + pose_array[:, 12]) / 2.0
-    shoulder_centers = (pose_array[:, 5] + pose_array[:, 6]) / 2.0
+    pose_array = flat_pose.reshape(-1, SKELETON_JOINTS, 3)
+    # The pelvis is the pose root, so centring on it removes camera placement
+    # without the wobble that a limb midpoint would introduce.
+    roots = pose_array[:, PELVIS]
+    shoulder_centers = (pose_array[:, L_SHOULDER] + pose_array[:, R_SHOULDER]) / 2.0
     torso_lengths = np.linalg.norm(shoulder_centers - roots, axis=1)
     valid_scale = torso_lengths[np.isfinite(torso_lengths) & (torso_lengths > 1e-6)]
     scale = float(np.median(valid_scale)) if valid_scale.size else 1.0

@@ -23,7 +23,12 @@ from visualization.dataset import (
     resolve_dataset_root,
     write_manifest,
 )
-from visualization.playback import normalized_timeline_position, playback_interval, timeline_frame_count
+from visualization.playback import (
+    normalized_timeline_position,
+    playback_interval,
+    playback_start_frame,
+    timeline_frame_count,
+)
 
 
 class DatasetParsingTests(unittest.TestCase):
@@ -37,6 +42,12 @@ class DatasetParsingTests(unittest.TestCase):
         self.assertEqual(normalized_timeline_position(0, 1), 0)
         self.assertAlmostEqual(playback_interval(2.0, 3, 1.0), 1.0)
         self.assertAlmostEqual(playback_interval(2.0, 3, 2.0), 0.5)
+
+    def test_playback_resumes_mid_clip_but_restarts_after_completion(self) -> None:
+        self.assertEqual(playback_start_frame(3, 10), 3)
+        self.assertEqual(playback_start_frame(9, 10), 0)
+        self.assertEqual(playback_start_frame(12, 10), 0)
+        self.assertEqual(playback_start_frame(0, 1), 0)
 
     def test_parse_training_member(self) -> None:
         source = DataSource("train", "zip", "/tmp/HAR_full.zip")

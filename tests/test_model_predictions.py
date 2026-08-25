@@ -10,6 +10,8 @@ test_modeling.
 from __future__ import annotations
 
 import csv
+import json
+import math
 import tempfile
 import unittest
 from pathlib import Path
@@ -39,10 +41,18 @@ try:
     import pandas as pd
 
     from visualization.app import (
+        SKELETON_EDGES,
+        SKELETON_JOINT_NAMES,
+        _skeleton_edge_chain,
+        _stabilize_skeleton_points,
+        _skeleton_viewer_html,
         add_predictions,
         add_split_predictions,
         correctness_flag,
         merge_prediction_sources,
+        skeleton_axis_ranges,
+        skeleton_calibration,
+        skeleton_figure,
     )
 
     HAS_APP_DEPS = True
@@ -62,6 +72,157 @@ except ImportError as exc:  # pragma: no cover
 needs_numpy = unittest.skipUnless(HAS_NUMPY, "needs numpy")
 needs_app = unittest.skipUnless(HAS_APP_DEPS, "needs visualization/requirements.txt")
 needs_modeling = unittest.skipUnless(HAS_MODELING, "needs modeling/requirements.txt")
+
+
+@needs_app
+class SkeletonFigureTests(unittest.TestCase):
+    def test_uses_h36m_connections_and_equal_axis_scale(self) -> None:
+        keypoints = [[float(index), float(index % 3), float(index * 2)] for index in range(17)]
+        payload = json.dumps([{"keypoints": keypoints, "keypoint_scores": [1.0] * 17}]).encode()
+
+        figure = skeleton_figure(payload, uirevision="test-clip")
+
+        self.assertIsNotNone(figure)
+        assert figure is not None
+        self.assertEqual(
+            SKELETON_EDGES,
+            (
+                (0, 1), (1, 2), (2, 3),
+                (0, 4), (4, 5), (5, 6),
+                (0, 7), (7, 8), (8, 9), (9, 10),
+                (8, 11), (11, 12), (12, 13),
+                (8, 14), (14, 15), (15, 16),
+            ),
+        )
+        bones, joints = figure.data
+        self.assertEqual(
+            list(zip(bones.x[::3], bones.x[1::3])),
+            [(keypoints[start][0], keypoints[end][0]) for start, end in SKELETON_EDGES],
+        )
+        self.assertTrue(joints.text[0].startswith("Pelvis<br>"))
+
+        scene = figure.layout.scene
+        spans = [axis.range[1] - axis.range[0] for axis in (scene.xaxis, scene.yaxis, scene.zaxis)]
+        self.assertAlmostEqual(spans[0], spans[1])
+        self.assertAlmostEqual(spans[1], spans[2])
+        self.assertEqual(scene.camera.up.z, 1)
+        self.assertEqual(scene.camera.eye.x, 0)
+        self.assertGreater(scene.camera.eye.y, 0)
+        self.assertEqual(scene.camera.eye.z, 0)
+        self.assertEqual(figure.layout.uirevision, "test-clip")
+        self.assertEqual(scene.uirevision, "test-clip")
+
+    def test_clip_ranges_keep_scale_fixed_between_frames(self) -> None:
+        first_points = [[float(index), 0.0, float(index * 2)] for index in range(17)]
+        second_points = [[float(index * 2), 0.5, float(index)] for index in range(17)]
+        payloads = [
+            json.dumps([{"keypoints": points, "keypoint_scores": [1.0] * 17}]).encode()
+            for points in (first_points, second_points)
+        ]
+
+        axis_ranges = skeleton_axis_ranges(payloads)
+        first_figure = skeleton_figure(payloads[0], axis_ranges)
+        second_figure = skeleton_figure(payloads[1], axis_ranges)
+
+        self.assertIsNotNone(first_figure)
+        self.assertIsNotNone(second_figure)
+        assert first_figure is not None and second_figure is not None
+        first_scene = first_figure.layout.scene
+        second_scene = second_figure.layout.scene
+        for first_axis, second_axis in zip(
+            (first_scene.xaxis, first_scene.yaxis, first_scene.zaxis),
+            (second_scene.xaxis, second_scene.yaxis, second_scene.zaxis),
+        ):
+            self.assertEqual(first_axis.range, second_axis.range)
+
+    def test_viewer_preserves_camera_and_embeds_each_frame(self) -> None:
+        points = [[float(index), 0.0, float(index * 2)] for index in range(17)]
+        payload = json.dumps([{"keypoints": points, "keypoint_scores": [1.0] * 17}]).encode()
+        html = _skeleton_viewer_html(payload, None, None, "test:clip-1")
+
+        self.assertIsNotNone(html)
+        assert html is not None
+        self.assertIn("pointermove", html)
+        self.assertIn("sessionStorage", html)
+        self.assertIn("cuhkx:skeleton-camera:test:clip-1", html)
+        self.assertIn('"points":[[0.0,0.0,0.0]', html)
+
+    def test_clip_median_lengths_stabilize_each_frame(self) -> None:
+        first_points = [[float(index), 0.0, float(index * 2)] for index in range(17)]
+        second_points = [[float(index * 2), 0.0, float(index * 4)] for index in range(17)]
+        payloads = [
+            json.dumps([{"keypoints": points, "keypoint_scores": [1.0] * 17}]).encode()
+            for points in (first_points, second_points)
+        ]
+
+        _, bone_lengths = skeleton_calibration(payloads)
+
+        self.assertIsNotNone(bone_lengths)
+        assert bone_lengths is not None
+        for points in (first_points, second_points):
+            stabilized = _stabilize_skeleton_points(
+                [tuple(point) for point in points],
+                bone_lengths,
+            )
+            for expected, (start, end) in zip(bone_lengths, SKELETON_EDGES, strict=True):
+                self.assertAlmostEqual(math.dist(stabilized[start], stabilized[end]), expected)
+
+    def test_stabilized_pose_keeps_every_joint_attached(self) -> None:
+        """Bone lengths alone cannot detect a scrambled skeleton.
+
+        Stabilization walks outward from the pelvis, so a joint whose parent has
+        not been placed yet is built from the origin instead. Every bone would
+        still measure the right length, so only checking positions catches it.
+        """
+
+        points = [(float(index), float(index % 4), float(index * 2)) for index in range(17)]
+        payload = json.dumps(
+            [{"keypoints": [list(point) for point in points], "keypoint_scores": [1.0] * 17}]
+        ).encode()
+        _, bone_lengths = skeleton_calibration([payload])
+        assert bone_lengths is not None
+
+        stabilized = _stabilize_skeleton_points(points, bone_lengths)
+
+        # Lengths are the clip medians of a single frame, so the pose is
+        # reproduced exactly rather than merely having correct bone lengths.
+        for original, rebuilt in zip(points, stabilized, strict=True):
+            self.assertAlmostEqual(math.dist(original, rebuilt), 0.0, places=6)
+
+    def test_edge_chain_is_a_tree_rooted_at_the_pelvis(self) -> None:
+        chain = _skeleton_edge_chain(SKELETON_EDGES)
+        self.assertEqual(len(chain), len(SKELETON_EDGES))
+        placed = {0}
+        for start, end, edge_index in chain:
+            self.assertIn(start, placed, "parent joint must be placed before its child")
+            placed.add(end)
+            self.assertEqual(SKELETON_EDGES[edge_index], (start, end))
+        self.assertEqual(placed, set(range(len(SKELETON_JOINT_NAMES))))
+
+    def test_edge_chain_rejects_a_disconnected_edge_list(self) -> None:
+        with self.assertRaisesRegex(ValueError, "one tree rooted at joint 0"):
+            _skeleton_edge_chain(((0, 1), (5, 6)))
+        with self.assertRaisesRegex(ValueError, "more than one parent"):
+            _skeleton_edge_chain(((0, 1), (0, 2), (1, 2)))
+
+    def test_reordered_edges_still_rebuild_the_pose(self) -> None:
+        """Reordering SKELETON_EDGES must not scramble the rendered skeleton."""
+
+        points = [(float(index), float(index % 3), float(index * 2)) for index in range(17)]
+        payload = json.dumps(
+            [{"keypoints": [list(point) for point in points], "keypoint_scores": [1.0] * 17}]
+        ).encode()
+        _, bone_lengths = skeleton_calibration([payload])
+        assert bone_lengths is not None
+        expected = _stabilize_skeleton_points(points, bone_lengths)
+
+        # Children before parents — the order that used to build from the origin.
+        reversed_edges = tuple(reversed(SKELETON_EDGES))
+        reversed_lengths = tuple(reversed(bone_lengths))
+        with patch("visualization.app.SKELETON_EDGE_CHAIN", _skeleton_edge_chain(reversed_edges)):
+            rebuilt = _stabilize_skeleton_points(points, reversed_lengths)
+        for first, second in zip(expected, rebuilt, strict=True):
+            self.assertAlmostEqual(math.dist(first, second), 0.0, places=6)
 
 
 class DiscoverModelArtifactsTests(unittest.TestCase):

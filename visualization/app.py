@@ -7,11 +7,12 @@ import io
 import json
 import math
 import re
+import statistics
 import subprocess
 import sys
 from collections import Counter
 from pathlib import Path, PurePosixPath
-from typing import Callable, Mapping
+from typing import Callable, Iterable, Mapping
 
 # Streamlit adds this script's directory to sys.path, but not necessarily the
 # repository root when launched by absolute path or from another directory.
@@ -23,6 +24,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 from plotly.subplots import make_subplots
 
 from visualization.algorithm_comparison import render_algorithm_comparison
@@ -38,7 +40,12 @@ from visualization.dataset import (
     read_members,
     resolve_dataset_root,
 )
-from visualization.playback import normalized_timeline_position, playback_interval, timeline_frame_count
+from visualization.playback import (
+    normalized_timeline_position,
+    playback_interval,
+    playback_start_frame,
+    timeline_frame_count,
+)
 from visualization.predictions import (
     ClipPrediction,
     PredictionTable,
@@ -57,24 +64,96 @@ st.set_page_config(page_title="CUHK-X Dataset Explorer", page_icon="🧭", layou
 
 INITIAL_CLIP_LIMIT = 200
 
+SKELETON_JOINT_NAMES = (
+    "Pelvis",
+    "Right hip",
+    "Right knee",
+    "Right ankle",
+    "Left hip",
+    "Left knee",
+    "Left ankle",
+    "Spine",
+    "Thorax",
+    "Neck",
+    "Head",
+    "Left shoulder",
+    "Left elbow",
+    "Left wrist",
+    "Right shoulder",
+    "Right elbow",
+    "Right wrist",
+)
+
+# Skeleton predictions use the Human3.6M 17-joint order, not COCO. Keeping the
+# two orders separate is important: COCO indices turn the legs and torso into
+# long crossing lines even though all of the underlying points are valid.
 SKELETON_EDGES = (
     (0, 1),
-    (0, 2),
-    (1, 3),
-    (2, 4),
+    (1, 2),
+    (2, 3),
+    (0, 4),
+    (4, 5),
     (5, 6),
-    (5, 7),
-    (7, 9),
-    (6, 8),
-    (8, 10),
-    (5, 11),
-    (6, 12),
+    (0, 7),
+    (7, 8),
+    (8, 9),
+    (9, 10),
+    (8, 11),
     (11, 12),
-    (11, 13),
-    (13, 15),
-    (12, 14),
-    (14, 16),
+    (12, 13),
+    (8, 14),
+    (14, 15),
+    (15, 16),
 )
+
+SKELETON_COLORS = (
+    "#00CC96",
+    "#636EFA",
+    "#EF553B",
+    "#AB63FA",
+    "#FFA15A",
+)
+
+
+def _skeleton_edge_chain(
+    edges: tuple[tuple[int, int], ...],
+) -> tuple[tuple[int, int, int], ...]:
+    """Order ``edges`` parent-before-child as ``(start, end, edge_index)``.
+
+    ``_stabilize_skeleton_points`` walks outward from the pelvis and needs each
+    edge's start joint to be placed before its end joint. Deriving that order
+    here rather than assuming ``SKELETON_EDGES`` already has it means reordering
+    the edge list cannot silently produce a scrambled skeleton — the bone
+    lengths would still come out correct, so no length-based test would notice.
+    """
+
+    children: dict[int, list[tuple[int, int]]] = {}
+    for index, (start, end) in enumerate(edges):
+        children.setdefault(start, []).append((end, index))
+    chain: list[tuple[int, int, int]] = []
+    placed = {0}
+    queue = [0]
+    while queue:
+        start = queue.pop(0)
+        for end, index in children.get(start, ()):
+            if end in placed:
+                raise ValueError(f"SKELETON_EDGES joint {end} has more than one parent")
+            placed.add(end)
+            chain.append((start, end, index))
+            queue.append(end)
+    if len(chain) != len(edges):
+        raise ValueError("SKELETON_EDGES must form one tree rooted at joint 0")
+    return tuple(chain)
+
+
+SKELETON_EDGE_CHAIN = _skeleton_edge_chain(SKELETON_EDGES)
+
+SkeletonAxisRanges = tuple[
+    tuple[float, float],
+    tuple[float, float],
+    tuple[float, float],
+]
+SkeletonBoneLengths = tuple[float, ...]
 
 
 def natural_key(value: object) -> tuple[object, ...]:
@@ -215,6 +294,15 @@ def cached_clip_index(source_data: dict[str, str], clip_id: str) -> dict[str, li
 @st.cache_data(show_spinner=False, max_entries=128)
 def cached_payloads(source_data: dict[str, str], member_paths: tuple[str, ...]) -> dict[str, bytes]:
     return read_members(source_from_dict(source_data), member_paths)
+
+
+@st.cache_data(show_spinner=False, max_entries=128)
+def cached_skeleton_calibration(
+    source_data: dict[str, str],
+    member_paths: tuple[str, ...],
+) -> tuple[SkeletonAxisRanges | None, SkeletonBoneLengths | None]:
+    payloads = read_members(source_from_dict(source_data), member_paths)
+    return skeleton_calibration(payloads.values())
 
 
 @st.cache_data(show_spinner=False)
@@ -622,34 +710,135 @@ def render_overview(frame: pd.DataFrame) -> None:
     st.dataframe(pattern_counts, hide_index=True, width="stretch")
 
 
-def skeleton_figure(data: bytes) -> go.Figure | None:
+def _skeleton_people(
+    data: bytes,
+) -> list[tuple[list[tuple[float, float, float]], list[float]]]:
     try:
         people = json.loads(data)
     except (UnicodeDecodeError, json.JSONDecodeError):
-        return None
+        return []
     if not isinstance(people, list) or not people:
+        return []
+
+    parsed = []
+    for person in people:
+        if not isinstance(person, dict):
+            continue
+        keypoints = person.get("keypoints", [])
+        if len(keypoints) != len(SKELETON_JOINT_NAMES):
+            continue
+        try:
+            points = [tuple(float(value) for value in point) for point in keypoints]
+        except (TypeError, ValueError):
+            continue
+        if any(len(point) != 3 or not all(math.isfinite(value) for value in point) for point in points):
+            continue
+        raw_scores = person.get("keypoint_scores", [1.0] * len(points))
+        try:
+            scores = [float(score) for score in raw_scores]
+        except (TypeError, ValueError):
+            scores = [1.0] * len(points)
+        if len(scores) != len(points):
+            scores = [1.0] * len(points)
+        parsed.append((points, scores))
+    return parsed
+
+
+def _skeleton_axis_ranges_from_points(
+    points: list[tuple[float, float, float]],
+) -> SkeletonAxisRanges | None:
+    if not points:
+        return None
+    bounds = tuple(
+        (min(point[axis] for point in points), max(point[axis] for point in points))
+        for axis in range(3)
+    )
+    centers = tuple((low + high) / 2.0 for low, high in bounds)
+    half_span = max(max(high - low for low, high in bounds) * 0.58, 1e-3)
+    return (
+        (centers[0] - half_span, centers[0] + half_span),
+        (centers[1] - half_span, centers[1] + half_span),
+        (centers[2] - half_span, centers[2] + half_span),
+    )
+
+
+def skeleton_axis_ranges(
+    payloads: Iterable[bytes],
+) -> SkeletonAxisRanges | None:
+    """Return one equal-scale axis cube covering every pose in a clip."""
+
+    points = [
+        point
+        for payload in payloads
+        for person_points, _ in _skeleton_people(payload)
+        for point in person_points
+    ]
+    return _skeleton_axis_ranges_from_points(points)
+
+
+def _stabilize_skeleton_points(
+    points: list[tuple[float, float, float]],
+    bone_lengths: SkeletonBoneLengths,
+) -> list[tuple[float, float, float]]:
+    """Keep pose directions while enforcing clip-median bone lengths."""
+
+    stabilized = [points[0], *([(0.0, 0.0, 0.0)] * (len(points) - 1))]
+    for start, end, edge_index in SKELETON_EDGE_CHAIN:
+        target_length = bone_lengths[edge_index]
+        direction = tuple(points[end][axis] - points[start][axis] for axis in range(3))
+        source_length = math.sqrt(sum(value * value for value in direction))
+        if source_length <= 1e-8:
+            stabilized[end] = stabilized[start]
+            continue
+        stabilized[end] = tuple(
+            stabilized[start][axis] + direction[axis] * target_length / source_length
+            for axis in range(3)
+        )
+    return stabilized
+
+
+def skeleton_calibration(
+    payloads: Iterable[bytes],
+) -> tuple[SkeletonAxisRanges | None, SkeletonBoneLengths | None]:
+    """Compute fixed display bounds and bone lengths for one clip."""
+
+    frames = [_skeleton_people(payload) for payload in payloads]
+    raw_points = [point for people in frames for points, _ in people for point in points]
+    samples: list[list[float]] = [[] for _ in SKELETON_EDGES]
+    for people in frames:
+        for points, _ in people:
+            for index, (start, end) in enumerate(SKELETON_EDGES):
+                length = math.dist(points[start], points[end])
+                if math.isfinite(length) and length > 1e-8:
+                    samples[index].append(length)
+    if not all(samples):
+        return _skeleton_axis_ranges_from_points(raw_points), None
+
+    bone_lengths = tuple(statistics.median(lengths) for lengths in samples)
+    stabilized_points = [
+        point
+        for people in frames
+        for points, _ in people
+        for point in _stabilize_skeleton_points(points, bone_lengths)
+    ]
+    return _skeleton_axis_ranges_from_points(stabilized_points), bone_lengths
+
+
+def skeleton_figure(
+    data: bytes,
+    axis_ranges: SkeletonAxisRanges | None = None,
+    uirevision: str = "skeleton",
+) -> go.Figure | None:
+    people = _skeleton_people(data)
+    if not people:
         return None
     figure = go.Figure()
-    for person_index, person in enumerate(people):
-        keypoints = person.get("keypoints", [])
-        if len(keypoints) < 17:
-            continue
-        scores = person.get("keypoint_scores", [1.0] * len(keypoints))
-        x = [point[0] for point in keypoints]
-        y = [point[1] for point in keypoints]
-        z = [point[2] for point in keypoints]
-        figure.add_trace(
-            go.Scatter3d(
-                x=x,
-                y=y,
-                z=z,
-                mode="markers",
-                marker={"size": [max(4, float(score) * 8) for score in scores]},
-                name=f"Person {person_index + 1}",
-                text=[f"Joint {index}<br>score={scores[index]:.3f}" for index in range(len(keypoints))],
-                hoverinfo="text",
-            )
-        )
+    plotted_points: list[tuple[float, float, float]] = []
+    for person_index, (points, scores) in enumerate(people):
+        x = [point[0] for point in points]
+        y = [point[1] for point in points]
+        z = [point[2] for point in points]
+        plotted_points.extend(points)
         edge_x: list[float | None] = []
         edge_y: list[float | None] = []
         edge_z: list[float | None] = []
@@ -663,24 +852,310 @@ def skeleton_figure(data: bytes) -> go.Figure | None:
                 y=edge_y,
                 z=edge_z,
                 mode="lines",
-                line={"width": 5},
+                line={"color": SKELETON_COLORS[person_index % len(SKELETON_COLORS)], "width": 7},
                 showlegend=False,
                 hoverinfo="skip",
             )
         )
+        figure.add_trace(
+            go.Scatter3d(
+                x=x,
+                y=y,
+                z=z,
+                mode="markers",
+                marker={
+                    "color": SKELETON_COLORS[person_index % len(SKELETON_COLORS)],
+                    "size": [max(4, min(9, score * 8)) for score in scores],
+                },
+                name=f"Person {person_index + 1}",
+                text=[
+                    f"{name}<br>score={score:.3f}"
+                    for name, score in zip(SKELETON_JOINT_NAMES, scores, strict=True)
+                ],
+                hoverinfo="text",
+            )
+        )
     if not figure.data:
         return None
+
+    # Fall back to frame-local bounds for standalone callers. The clip explorer
+    # supplies bounds computed from every frame so playback never zooms.
+    axis_ranges = axis_ranges or _skeleton_axis_ranges_from_points(plotted_points)
+    assert axis_ranges is not None
     figure.update_layout(
         height=520,
         margin={"l": 0, "r": 0, "t": 20, "b": 0},
+        uirevision=uirevision,
         scene={
-            "aspectmode": "data",
-            "xaxis_title": "x",
-            "yaxis_title": "y",
-            "zaxis_title": "z",
+            "aspectmode": "cube",
+            "uirevision": uirevision,
+            "camera": {
+                "up": {"x": 0, "y": 0, "z": 1},
+                # Look straight along the sensor depth axis. From +y, negative
+                # skeleton x appears on camera-right, matching the paired
+                # Depth Color and IR frames.
+                "eye": {"x": 0, "y": 2.5, "z": 0},
+                "projection": {"type": "orthographic"},
+            },
+            "xaxis": {"title": "Horizontal (x)", "range": axis_ranges[0]},
+            "yaxis": {"title": "Depth (y)", "range": axis_ranges[1]},
+            "zaxis": {"title": "Height (z)", "range": axis_ranges[2]},
         },
     )
     return figure
+
+
+def _skeleton_viewer_html(
+    data: bytes,
+    axis_ranges: SkeletonAxisRanges | None,
+    bone_lengths: SkeletonBoneLengths | None,
+    playback_identity: str,
+) -> str | None:
+    """Build an interactive skeleton viewer whose camera survives reruns."""
+
+    people = _skeleton_people(data)
+    if not people:
+        return None
+    if bone_lengths is not None:
+        people = [
+            (_stabilize_skeleton_points(person_points, bone_lengths), scores)
+            for person_points, scores in people
+        ]
+    points = [point for person_points, _ in people for point in person_points]
+    axis_ranges = axis_ranges or _skeleton_axis_ranges_from_points(points)
+    if axis_ranges is None:
+        return None
+
+    model = {
+        "people": [
+            {
+                "points": person_points,
+                "scores": scores,
+                "color": SKELETON_COLORS[index % len(SKELETON_COLORS)],
+                "name": f"Person {index + 1}",
+            }
+            for index, (person_points, scores) in enumerate(people)
+        ],
+        "edges": SKELETON_EDGES,
+        "jointNames": SKELETON_JOINT_NAMES,
+        "ranges": axis_ranges,
+    }
+    model_json = json.dumps(model, separators=(",", ":")).replace("</", "<\\/")
+    storage_key = json.dumps(f"cuhkx:skeleton-camera:{playback_identity}").replace("</", "<\\/")
+    template = """
+<style>
+  html, body { margin: 0; overflow: hidden; background: transparent; font-family: sans-serif; }
+  #viewer { position: relative; width: 100%; height: 520px; }
+  canvas { display: block; width: 100%; height: 100%; cursor: grab; touch-action: none; }
+  canvas.dragging { cursor: grabbing; }
+  #hint { position: absolute; left: 10px; top: 8px; color: #6b7280; font-size: 12px; }
+  #reset { position: absolute; right: 10px; top: 8px; border: 1px solid #aeb4bd;
+    border-radius: 6px; padding: 5px 9px; background: rgba(255,255,255,.86); cursor: pointer; }
+  #tooltip { display: none; position: absolute; pointer-events: none; padding: 5px 7px;
+    border-radius: 5px; background: rgba(30,34,40,.9); color: white; font-size: 12px; }
+</style>
+<div id="viewer">
+  <canvas id="skeleton"></canvas>
+  <div id="hint">Drag to rotate · Scroll to zoom</div>
+  <button id="reset" type="button">Reset view</button>
+  <div id="tooltip"></div>
+</div>
+<script>
+(() => {
+  const model = __MODEL__;
+  const storageKey = __STORAGE_KEY__;
+  const canvas = document.getElementById("skeleton");
+  const context = canvas.getContext("2d");
+  const tooltip = document.getElementById("tooltip");
+  const defaultCamera = {yaw: 0, pitch: 0, zoom: 1};
+  // Pitch must stay clear of straight up/down: the basis takes cross(forward,
+  // [0,0,1]), which degenerates to a zero vector there and collapses every
+  // projected point onto the centre. Clamp on restore too, not just on drag,
+  // so stored state from another build cannot produce a blank viewer.
+  const clampCamera = value => {
+    const number = (input, fallback) => (Number.isFinite(input) ? input : fallback);
+    return {
+      yaw: number(value.yaw, 0),
+      pitch: Math.max(-1.45, Math.min(1.45, number(value.pitch, 0))),
+      zoom: Math.max(0.55, Math.min(2.5, number(value.zoom, 1))),
+    };
+  };
+  let camera = {...defaultCamera};
+  try {
+    const stored = JSON.parse(window.parent.sessionStorage.getItem(storageKey) || "{}");
+    if (stored && typeof stored === "object") camera = clampCamera({...camera, ...stored});
+  } catch (_) {}
+  let dragging = false;
+  let lastPointer = null;
+  let projectedJoints = [];
+
+  const add = (a, b) => a.map((value, index) => value + b[index]);
+  const scale = (value, amount) => value.map(item => item * amount);
+  const dot = (a, b) => a.reduce((total, value, index) => total + value * b[index], 0);
+  const cross = (a, b) => [
+    a[1] * b[2] - a[2] * b[1],
+    a[2] * b[0] - a[0] * b[2],
+    a[0] * b[1] - a[1] * b[0],
+  ];
+  const normalize = value => {
+    const length = Math.sqrt(dot(value, value)) || 1;
+    return scale(value, 1 / length);
+  };
+  const centers = model.ranges.map(range => (range[0] + range[1]) / 2);
+  const halfSpan = (model.ranges[0][1] - model.ranges[0][0]) / 2;
+
+  function saveCamera() {
+    try { window.parent.sessionStorage.setItem(storageKey, JSON.stringify(camera)); } catch (_) {}
+  }
+
+  function basis() {
+    const horizontal = Math.cos(camera.pitch);
+    const eye = normalize([
+      Math.sin(camera.yaw) * horizontal,
+      Math.cos(camera.yaw) * horizontal,
+      Math.sin(camera.pitch),
+    ]);
+    const forward = scale(eye, -1);
+    const right = normalize(cross(forward, [0, 0, 1]));
+    return {eye, right, up: normalize(cross(right, forward))};
+  }
+
+  function project(point, width, height, cameraBasis) {
+    const centered = point.map((value, index) => (value - centers[index]) / halfSpan);
+    const pixels = Math.min(width, height) * 0.37 * camera.zoom;
+    return {
+      x: width / 2 + dot(centered, cameraBasis.right) * pixels,
+      y: height / 2 - dot(centered, cameraBasis.up) * pixels,
+      depth: dot(centered, cameraBasis.eye),
+    };
+  }
+
+  function draw() {
+    const width = canvas.clientWidth;
+    const height = canvas.clientHeight;
+    const ratio = window.devicePixelRatio || 1;
+    if (canvas.width !== Math.round(width * ratio) || canvas.height !== Math.round(height * ratio)) {
+      canvas.width = Math.round(width * ratio);
+      canvas.height = Math.round(height * ratio);
+    }
+    context.setTransform(ratio, 0, 0, ratio, 0, 0);
+    context.clearRect(0, 0, width, height);
+    const cameraBasis = basis();
+
+    const cube = [];
+    for (let index = 0; index < 8; index++) {
+      cube.push(project([
+        centers[0] + (index & 1 ? halfSpan : -halfSpan),
+        centers[1] + (index & 2 ? halfSpan : -halfSpan),
+        centers[2] + (index & 4 ? halfSpan : -halfSpan),
+      ], width, height, cameraBasis));
+    }
+    context.strokeStyle = "rgba(128,136,148,.28)";
+    context.lineWidth = 1;
+    for (const [start, end] of [[0,1],[0,2],[0,4],[1,3],[1,5],[2,3],[2,6],[3,7],[4,5],[4,6],[5,7],[6,7]]) {
+      context.beginPath();
+      context.moveTo(cube[start].x, cube[start].y);
+      context.lineTo(cube[end].x, cube[end].y);
+      context.stroke();
+    }
+
+    projectedJoints = [];
+    for (const person of model.people) {
+      const projected = person.points.map(point => project(point, width, height, cameraBasis));
+      const bones = model.edges.map(edge => ({edge, depth: (projected[edge[0]].depth + projected[edge[1]].depth) / 2}));
+      bones.sort((a, b) => a.depth - b.depth);
+      context.strokeStyle = person.color;
+      context.lineWidth = 6;
+      context.lineCap = "round";
+      for (const bone of bones) {
+        const start = projected[bone.edge[0]];
+        const end = projected[bone.edge[1]];
+        context.beginPath();
+        context.moveTo(start.x, start.y);
+        context.lineTo(end.x, end.y);
+        context.stroke();
+      }
+      projected.forEach((point, index) => {
+        const radius = Math.max(4, Math.min(8, person.scores[index] * 7));
+        context.beginPath();
+        context.arc(point.x, point.y, radius, 0, Math.PI * 2);
+        context.fillStyle = person.color;
+        context.fill();
+        context.strokeStyle = "white";
+        context.lineWidth = 1;
+        context.stroke();
+        projectedJoints.push({...point, radius, label: `${person.name} · ${model.jointNames[index]} · score=${person.scores[index].toFixed(3)}`});
+      });
+    }
+  }
+
+  canvas.addEventListener("pointerdown", event => {
+    dragging = true;
+    lastPointer = [event.clientX, event.clientY];
+    canvas.classList.add("dragging");
+    canvas.setPointerCapture(event.pointerId);
+    tooltip.style.display = "none";
+  });
+  canvas.addEventListener("pointermove", event => {
+    if (dragging) {
+      const dx = event.clientX - lastPointer[0];
+      const dy = event.clientY - lastPointer[1];
+      camera.yaw -= dx * 0.008;
+      camera.pitch = Math.max(-1.45, Math.min(1.45, camera.pitch + dy * 0.008));
+      lastPointer = [event.clientX, event.clientY];
+      saveCamera();
+      draw();
+      return;
+    }
+    const bounds = canvas.getBoundingClientRect();
+    const x = event.clientX - bounds.left;
+    const y = event.clientY - bounds.top;
+    const nearest = projectedJoints
+      .map(joint => ({joint, distance: Math.hypot(joint.x - x, joint.y - y)}))
+      .sort((a, b) => a.distance - b.distance)[0];
+    if (!nearest || nearest.distance > nearest.joint.radius + 5) {
+      tooltip.style.display = "none";
+      return;
+    }
+    tooltip.textContent = nearest.joint.label;
+    tooltip.style.left = `${x + 12}px`;
+    tooltip.style.top = `${y + 12}px`;
+    tooltip.style.display = "block";
+  });
+  canvas.addEventListener("pointerup", event => {
+    dragging = false;
+    canvas.classList.remove("dragging");
+    canvas.releasePointerCapture(event.pointerId);
+    saveCamera();
+  });
+  canvas.addEventListener("wheel", event => {
+    event.preventDefault();
+    camera.zoom = Math.max(0.55, Math.min(2.5, camera.zoom * Math.exp(-event.deltaY * 0.001)));
+    saveCamera();
+    draw();
+  }, {passive: false});
+  document.getElementById("reset").addEventListener("click", () => {
+    camera = {...defaultCamera};
+    saveCamera();
+    draw();
+  });
+  new ResizeObserver(draw).observe(document.getElementById("viewer"));
+  draw();
+})();
+</script>
+"""
+    return template.replace("__MODEL__", model_json).replace("__STORAGE_KEY__", storage_key)
+
+
+def _render_skeleton_viewer(html: str) -> None:
+    if hasattr(st, "iframe"):
+        st.iframe(html, width="stretch", height=520, tab_index=0)
+    else:  # pragma: no cover - compatibility with older supported Streamlit
+        # requirements.txt still allows streamlit<1.62, which has no st.iframe.
+        # components.html sandboxes the frame, so window.parent.sessionStorage
+        # throws and the camera simply resets between reruns instead of
+        # persisting. The viewer itself works either way.
+        components.html(html, height=520)
 
 
 def _float_at(row: list[str], index: int) -> float | None:
@@ -790,6 +1265,9 @@ def render_visual_frame(
     modalities: dict[str, list[str]],
     source_data: dict[str, str],
     static_payloads: dict[str, bytes],
+    skeleton_ranges: SkeletonAxisRanges | None,
+    skeleton_bone_lengths: SkeletonBoneLengths | None,
+    playback_identity: str,
     position: int,
 ) -> None:
     """Render all modalities that change as the playback cursor advances."""
@@ -821,10 +1299,17 @@ def render_visual_frame(
     with skeleton_column:
         st.subheader("3D skeleton")
         if skeleton_path:
-            figure = skeleton_figure(payloads[skeleton_path])
-            if figure is not None:
-                st.plotly_chart(figure, width="stretch")
-                st.caption("Connectivity assumes the common COCO 17-joint ordering.")
+            viewer_html = _skeleton_viewer_html(
+                payloads[skeleton_path],
+                skeleton_ranges,
+                skeleton_bone_lengths,
+                playback_identity,
+            )
+            if viewer_html is not None:
+                _render_skeleton_viewer(viewer_html)
+                st.caption(
+                    "Human3.6M 17-joint pose · camera-aligned · clip-stabilized limb lengths."
+                )
             else:
                 st.info("No valid person pose in this frame.")
         else:
@@ -977,8 +1462,16 @@ def render_clip_explorer(frame: pd.DataFrame, sources: dict[str, dict[str, str]]
         modalities = cached_clip_index(source_data, clip_id)
     imu_paths = modalities.get("IMU", [])
     radar_paths = modalities.get("Radar", [])
+    skeleton_paths = modalities.get("Skeleton", [])
     static_paths = tuple(dict.fromkeys([*imu_paths, *radar_paths]))
     static_payloads = cached_payloads(source_data, static_paths) if static_paths else {}
+    if skeleton_paths:
+        skeleton_ranges, skeleton_bone_lengths = cached_skeleton_calibration(
+            source_data,
+            tuple(skeleton_paths),
+        )
+    else:
+        skeleton_ranges, skeleton_bone_lengths = None, None
 
     frame_count = timeline_frame_count(modalities)
     playback_identity = f"{split}:{clip_id}"
@@ -993,8 +1486,23 @@ def render_clip_explorer(frame: pd.DataFrame, sources: dict[str, dict[str, str]]
 
     controls = st.columns((1, 1, 1.5, 5))
     running = bool(st.session_state.get("playback_running", False))
-    toggle_label = "⏸ Pause" if running else "▶ Play"
+    current_frame = min(int(st.session_state.get(frame_key, 0)), frame_count - 1)
+    # A single-frame clip is always "at the end", but it has never been played,
+    # so offering Replay rather than Play would be misleading.
+    finished = frame_count > 1 and current_frame >= frame_count - 1
+    toggle_label = "⏸ Pause" if running else ("↻ Replay" if finished else "▶ Play")
+    # Render the persistent widget before a button handler can call st.rerun().
+    # Otherwise Streamlit's widget cleanup drops its state during that partial
+    # pass and the next run recreates the speed at the default 1× value.
+    speed = controls[2].select_slider(
+        "Speed",
+        options=(0.5, 1.0, 2.0),
+        format_func=lambda value: f"{value:g}×",
+        key="playback_speed",
+    )
     if controls[0].button(toggle_label, key=f"playback_toggle:{playback_identity}", width="stretch"):
+        if not running:
+            st.session_state[frame_key] = playback_start_frame(current_frame, frame_count)
         st.session_state.playback_running = not running
         st.session_state.playback_hold_tick = not running
         st.rerun()
@@ -1003,12 +1511,6 @@ def render_clip_explorer(frame: pd.DataFrame, sources: dict[str, dict[str, str]]
         st.session_state.playback_running = False
         st.session_state.playback_hold_tick = False
         st.rerun()
-    speed = controls[2].select_slider(
-        "Speed",
-        options=(0.5, 1.0, 2.0),
-        format_func=lambda value: f"{value:g}×",
-        key="playback_speed",
-    )
     interval = playback_interval(row.get("duration_seconds"), frame_count, float(speed)) if running else None
 
     @st.fragment(run_every=interval)
@@ -1037,7 +1539,15 @@ def render_clip_explorer(frame: pd.DataFrame, sources: dict[str, dict[str, str]]
         )
         position = normalized_timeline_position(current, frame_count)
         st.caption(f"Frame {current + 1} of {frame_count} · {position}% through clip · {float(speed):g}×")
-        render_visual_frame(modalities, source_data, static_payloads, position)
+        render_visual_frame(
+            modalities,
+            source_data,
+            static_payloads,
+            skeleton_ranges,
+            skeleton_bone_lengths,
+            playback_identity,
+            position,
+        )
 
     playback_fragment()
 

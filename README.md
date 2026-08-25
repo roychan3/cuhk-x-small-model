@@ -274,15 +274,15 @@ There are six suites with different requirements:
 
 | Suite | Tests | Requires | Behavior without the requirement |
 |-------|-------|----------|----------------------------------|
-| `tests/test_visualization_dataset.py` | 15 | standard library only | always runs |
+| `tests/test_visualization_dataset.py` | 16 | standard library only | always runs |
 | `tests/test_predictions.py` | 7 | standard library only | always runs |
 | `tests/test_comparison_format.py` | 13 | standard library only | always runs; its 2 CLI-parity tests skip without `modeling/requirements.txt` |
-| `tests/test_model_predictions.py` | 23 | artifact discovery and CSV round-tripping need the standard library only; the rest need `numpy`, `visualization/requirements.txt` (for `visualization.app`), or `modeling/requirements.txt` | 5 tests always run; the other 18 skip. Dataset I/O is mocked throughout, so no suite needs the dataset |
+| `tests/test_model_predictions.py` | 31 | artifact discovery and CSV round-tripping need the standard library only; the rest need `numpy`, `visualization/requirements.txt` (for `visualization.app`), or `modeling/requirements.txt` | 5 tests always run; the other 26 skip. Dataset I/O is mocked throughout, so no suite needs the dataset |
 | `tests/test_algorithm_comparison.py` | 16 | `visualization/requirements.txt` + `numpy` (for confusion-matrix math) | collapses to 1 skip |
-| `tests/test_modeling.py` | 21 | `modeling/requirements.txt` | collapses to 1 skip |
+| `tests/test_modeling.py` | 26 | `modeling/requirements.txt` | collapses to 1 skip |
 
-So a bare interpreter reports `Ran 60 tests ... OK (skipped=22)`, while an
-interpreter with `visualization` + `modeling` deps reports `Ran 95 tests ... OK`
+So a bare interpreter reports `Ran 69 tests ... OK (skipped=30)`, while an
+interpreter with `visualization` + `modeling` deps reports `Ran 109 tests ... OK`
 (`skipped=1` when the optional real validation artifact is absent). A skip is
 expected, not a failure. Install the extras to run
 everything:

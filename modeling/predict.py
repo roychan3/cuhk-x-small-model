@@ -10,8 +10,8 @@ from pathlib import Path
 
 from modeling.algorithms import available_algorithms, get_algorithm
 from modeling.data import discover_test_clips
-from modeling.features import FeatureConfig, extract_feature_bundle
-from modeling.model import load_model
+from modeling.features import extract_feature_bundle
+from modeling.model import feature_config_from_artifact, load_model
 from visualization.dataset import resolve_dataset_root
 
 
@@ -71,10 +71,7 @@ def main() -> int:
         / "outputs"
         / f"{_artifact_name(model.algorithm_name)}_submission.csv"
     )
-    config_values = dict(model.feature_config)
-    if "include_legacy_ir" not in config_values:
-        config_values["include_legacy_ir"] = "ir" in model.reducers
-    config = FeatureConfig(**config_values)
+    config = feature_config_from_artifact(model)
     records = discover_test_clips(resolve_dataset_root(args.dataset_root), args.test_csv)
     bundle = extract_feature_bundle(records, config, n_jobs=args.n_jobs)
     predictions = model.predict(bundle)

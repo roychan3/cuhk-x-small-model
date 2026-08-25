@@ -30,12 +30,23 @@ some additional clips have only partial IMU device coverage.
 - IMU engineered features: jerk and spectral summaries, circular Euler-angle
   statistics, relative quaternion motion, per-device covariance, sampling
   metadata, and left/right or limb/torso agreement features.
-- Skeleton base features: primary-person tracking, hip centering, torso
+- Skeleton base features: primary-person tracking, pelvis centering, torso
   normalization, interpolation to 32 frames, positions, velocities, and
   confidence scores.
 - Skeleton engineered features: joint angles and distances, torso geometry,
   root displacement, per-joint speed and acceleration, confidence summaries,
   and periodic-motion statistics.
+
+Skeleton predictions use the **Human3.6M 17-joint order, not COCO**: joint 0 is
+the root pelvis (at exactly `x == y == 0` in every frame), 10 is the head, and
+3 and 6 are the ankles. Index them through the named constants in
+`modeling/features.py` (`PELVIS`, `L_WRIST`, `HEAD`, …) rather than by number.
+Reading these poses as COCO is silent — every index is in range and the
+features still extract — but it turns "wrist to head" into a near-rigid
+trunk length and inverts the torso vector. Artifacts written before this was
+corrected record no `skeleton_layout` in their feature config, and
+`feature_config_from_artifact` refuses them rather than predicting from
+features they were never fitted on.
 
 The three active high-dimensional base blocks are independently mean-imputed,
 standardized, and reduced with PCA to 320 total components. The four compact
