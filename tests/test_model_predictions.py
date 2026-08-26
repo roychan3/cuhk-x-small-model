@@ -23,6 +23,7 @@ from visualization.predictions import (
     ClipPrediction,
     PredictionTable,
     _prediction_table_from_arrays,
+    combine_prediction_tables,
     discover_model_artifacts,
     generate_all_split_predictions,
     generate_predictions_from_model,
@@ -56,9 +57,7 @@ try:
         _stabilize_skeleton_points,
         _timeline_selections,
         add_predictions,
-        add_split_predictions,
         correctness_flag,
-        merge_prediction_sources,
         skeleton_calibration,
     )
 
@@ -599,6 +598,42 @@ class SavePredictionCsvTests(unittest.TestCase):
             self.assertEqual(out.read_bytes(), text.encode("utf-8"))
             self.assertIn(b"\r\n", out.read_bytes())
 
+    def test_combined_train_and_test_csv_round_trips_full_clip_ids(self) -> None:
+        mapping = {0: "0_Wash_face", 1: "1_Brush_teeth"}
+        train_id = "0_Wash_face/user1/1-1-1"
+        train = PredictionTable(
+            by_clip={
+                train_id: ClipPrediction(train_id, 0, "0_Wash_face", train_id)
+            },
+            rows_read=1,
+            blank_predictions=0,
+        )
+        test = PredictionTable(
+            by_clip={
+                "SM_test_0001": ClipPrediction(
+                    "SM_test_0001",
+                    1,
+                    "1_Brush_teeth",
+                    "small_model_track_test/SM_test_0001/",
+                )
+            },
+            rows_read=1,
+            blank_predictions=0,
+        )
+        combined = combine_prediction_tables({"train": train, "test": test})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output = save_prediction_csv(
+                combined,
+                Path(tmp) / "both.csv",
+                identifier="clip_id",
+            )
+            from visualization.predictions import load_prediction_csv
+
+            loaded = load_prediction_csv(output, mapping)
+
+        self.assertEqual(set(loaded.by_clip), {train_id, "SM_test_0001"})
+
 
 @needs_app
 class AddPredictionsTrainTestTests(unittest.TestCase):
@@ -650,26 +685,6 @@ class AddPredictionsTrainTestTests(unittest.TestCase):
         enriched2 = add_predictions(frame2, partial)
         self.assertTrue(pd.isna(enriched2.loc[enriched2["clip_id"] == "0_Wash_face/user1/1-1-3", "prediction_correct"].iloc[0]))
 
-    def test_add_split_predictions_merges_both_splits(self) -> None:
-        frame = pd.DataFrame(
-            [
-                {"split": "train", "clip_id": "0_Wash_face/user1/1-1-1", "action_id": 0, "action_name": "0_Wash_face"},
-                {"split": "test", "clip_id": "SM_test_0001", "action_id": None, "action_name": None},
-            ]
-        )
-        train_table = PredictionTable(
-            by_clip={"0_Wash_face/user1/1-1-1": ClipPrediction("0_Wash_face/user1/1-1-1", 0, "0_Wash_face", "x")},
-            rows_read=1,
-            blank_predictions=0,
-        )
-        test_table = PredictionTable(
-            by_clip={"SM_test_0001": ClipPrediction("SM_test_0001", 1, "1_Brush_teeth", "small_model_track_test/SM_test_0001")},
-            rows_read=1,
-            blank_predictions=0,
-        )
-        enriched = add_split_predictions(frame, {"train": train_table, "test": test_table})
-        self.assertEqual(enriched.loc[enriched["clip_id"] == "0_Wash_face/user1/1-1-1", "prediction_action_id"].iloc[0], 0)
-        self.assertEqual(enriched.loc[enriched["clip_id"] == "SM_test_0001", "prediction_action_id"].iloc[0], 1)
 
 
 @needs_modeling
@@ -779,94 +794,6 @@ class ExtractFeatureBundleProgressTests(unittest.TestCase):
         )
 
 
-@needs_app
-class MergePredictionSourcesTests(unittest.TestCase):
-    """Regression tests for CSV + model-generated predictions being combined.
-
-    Attaching the two sources with two ``add_predictions`` calls used to wipe
-    out everything the first call wrote, because ``add_predictions`` reassigns
-    the prediction columns wholesale.
-    """
-
-    def setUp(self) -> None:
-        self.frame = pd.DataFrame(
-            [
-                {"split": "train", "clip_id": "0_Wash_face/user1/1-1-1", "action_id": 0, "action_name": "0_Wash_face"},
-                {"split": "train", "clip_id": "1_Brush_teeth/user1/1-1-1", "action_id": 1, "action_name": "1_Brush_teeth"},
-                {"split": "test", "clip_id": "SM_test_0001", "action_id": None, "action_name": None},
-                {"split": "test", "clip_id": "SM_test_0002", "action_id": None, "action_name": None},
-            ]
-        )
-        self.generated = {
-            "train": PredictionTable(
-                by_clip={
-                    "0_Wash_face/user1/1-1-1": ClipPrediction("0_Wash_face/user1/1-1-1", 0, "0_Wash_face", "x"),
-                    "1_Brush_teeth/user1/1-1-1": ClipPrediction("1_Brush_teeth/user1/1-1-1", 0, "0_Wash_face", "y"),
-                },
-                rows_read=2,
-                blank_predictions=0,
-            ),
-            "test": PredictionTable(
-                by_clip={"SM_test_0001": ClipPrediction("SM_test_0001", 1, "1_Brush_teeth", "t/SM_test_0001")},
-                rows_read=1,
-                blank_predictions=0,
-            ),
-        }
-
-    def _predictions(self, frame: pd.DataFrame) -> dict[str, object]:
-        return {
-            str(row["clip_id"]): row["prediction_action_id"]
-            for _, row in frame.iterrows()
-        }
-
-    def test_csv_extras_do_not_drop_generated_predictions(self) -> None:
-        csv_table = PredictionTable(
-            by_clip={"SM_test_0002": ClipPrediction("SM_test_0002", 1, "1_Brush_teeth", "t/SM_test_0002")},
-            rows_read=1,
-            blank_predictions=0,
-        )
-        enriched = add_split_predictions(
-            self.frame, merge_prediction_sources(self.generated, csv_table)
-        )
-        got = self._predictions(enriched)
-        self.assertEqual(got["0_Wash_face/user1/1-1-1"], 0)
-        self.assertEqual(got["1_Brush_teeth/user1/1-1-1"], 0)
-        self.assertEqual(got["SM_test_0001"], 1)
-        self.assertEqual(got["SM_test_0002"], 1)
-
-    def test_generated_wins_on_conflicting_clip_ids(self) -> None:
-        csv_table = PredictionTable(
-            by_clip={"SM_test_0001": ClipPrediction("SM_test_0001", 0, "0_Wash_face", "t/SM_test_0001")},
-            rows_read=1,
-            blank_predictions=0,
-        )
-        merged = merge_prediction_sources(self.generated, csv_table)
-        self.assertNotIn("csv", merged)
-        enriched = add_split_predictions(self.frame, merged)
-        # The model predicted 1; the CSV said 0. The model must win.
-        self.assertEqual(self._predictions(enriched)["SM_test_0001"], 1)
-
-    def test_without_csv_is_a_passthrough(self) -> None:
-        self.assertEqual(merge_prediction_sources(self.generated, None), self.generated)
-
-    def test_add_predictions_replaces_rather_than_merges(self) -> None:
-        """Pins the hazard that ``merge_prediction_sources`` exists to avoid.
-
-        If this ever starts failing because ``add_predictions`` learned to merge,
-        the single-call requirement can be relaxed.
-        """
-
-        first = add_split_predictions(self.frame, self.generated)
-        self.assertEqual(self._predictions(first)["SM_test_0001"], 1)
-        second = add_predictions(
-            first,
-            PredictionTable(
-                by_clip={"SM_test_0002": ClipPrediction("SM_test_0002", 1, "1_Brush_teeth", "z")},
-                rows_read=1,
-                blank_predictions=0,
-            ),
-        )
-        self.assertTrue(pd.isna(self._predictions(second)["SM_test_0001"]))
 
 
 @needs_app

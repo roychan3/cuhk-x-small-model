@@ -7,6 +7,7 @@ from pathlib import Path
 
 from visualization.predictions import (
     clip_id_from_submission_path,
+    discover_model_artifacts,
     discover_prediction_csvs,
     load_action_mapping,
     parse_prediction_csv,
@@ -35,8 +36,21 @@ class PredictionParsingTests(unittest.TestCase):
         self.assertEqual(clip_id_from_submission_path("SM_test_0042/"), "SM_test_0042")
 
     def test_rejects_missing_columns(self) -> None:
-        with self.assertRaisesRegex(ValueError, "path and prediction"):
+        with self.assertRaisesRegex(ValueError, "path or clip_id"):
             parse_prediction_csv("clip,label\na,0\n", self.actions)
+
+    def test_preserves_hierarchical_training_clip_ids(self) -> None:
+        table = parse_prediction_csv(
+            "clip_id,prediction\n"
+            "0_Wash_face/user1/1-1-1,0\n"
+            "34_Sit_down/user2/2-1-3,34\n",
+            self.actions,
+        )
+
+        self.assertEqual(
+            set(table.by_clip),
+            {"0_Wash_face/user1/1-1-1", "34_Sit_down/user2/2-1-3"},
+        )
 
     def test_rejects_unknown_or_non_integer_actions(self) -> None:
         with self.assertRaisesRegex(ValueError, "Unknown action_id 39"):
@@ -83,14 +97,28 @@ class PredictionParsingTests(unittest.TestCase):
             outputs.mkdir()
             older = outputs / "older_submission.csv"
             newer = outputs / "newer_submission.csv"
+            custom = outputs / "experiment_predictions.csv"
             unrelated = outputs / "metrics.csv"
             older.write_text("path,prediction\n", encoding="utf-8")
             newer.write_text("path,prediction\n", encoding="utf-8")
+            custom.write_text("clip_id,prediction\n", encoding="utf-8")
             unrelated.write_text("metric,value\naccuracy,0.5\n", encoding="utf-8")
             os.utime(older, ns=(1_000_000_000, 1_000_000_000))
             os.utime(newer, ns=(2_000_000_000, 2_000_000_000))
+            os.utime(custom, ns=(3_000_000_000, 3_000_000_000))
 
-            self.assertEqual(discover_prediction_csvs(temporary), [newer, older])
+            self.assertEqual(
+                discover_prediction_csvs(temporary), [custom, newer, older]
+            )
+
+    def test_discovers_custom_model_filenames(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            artifacts = Path(temporary) / "artifacts" / "experiment"
+            artifacts.mkdir(parents=True)
+            model = artifacts / "best-classifier.joblib"
+            model.write_bytes(b"model")
+
+            self.assertEqual(discover_model_artifacts(temporary), [model])
 
 
 if __name__ == "__main__":

@@ -12,7 +12,7 @@ import statistics
 import subprocess
 import sys
 from collections import Counter
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Iterable, Mapping
 from functools import lru_cache
 from pathlib import Path, PurePosixPath
 
@@ -50,18 +50,16 @@ from visualization.playback import (
     timeline_member_index,
 )
 from visualization.predictions import (
-    ClipPrediction,
     PredictionTable,
-    discover_model_artifacts,
     discover_prediction_csvs,
-    generate_all_split_predictions,
-    generate_predictions_from_model,
     load_action_mapping,
     load_prediction_csv,
-    parse_prediction_csv,
-    prediction_csv_text,
 )
-from visualization.training_pipeline import render_training_pipeline
+from visualization.training_pipeline import (
+    FULL_DATASET,
+    render_training_pipeline,
+    workflow_dataset_paths,
+)
 
 st.set_page_config(page_title="CUHK-X Dataset Explorer", page_icon="🧭", layout="wide")
 
@@ -329,14 +327,6 @@ def cached_prediction_file(
     return load_prediction_csv(prediction_path, dict(action_mapping))
 
 
-@st.cache_data(show_spinner=False)
-def cached_uploaded_predictions(
-    contents: bytes,
-    action_mapping: tuple[tuple[int, str], ...],
-) -> PredictionTable:
-    return parse_prediction_csv(contents.decode("utf-8-sig"), dict(action_mapping))
-
-
 def modality_coverage(frame: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for modality in MODALITIES:
@@ -379,54 +369,6 @@ def add_predictions(frame: pd.DataFrame, predictions: PredictionTable) -> pd.Dat
         enriched["prediction_correct"] = enriched["prediction_correct"].astype("boolean")
         enriched.loc[enriched["split"] == "test", "prediction_correct"] = pd.NA
     return enriched
-
-
-def add_split_predictions(
-    frame: pd.DataFrame,
-    predictions_by_split: Mapping[str, PredictionTable],
-) -> pd.DataFrame:
-    """Attach predictions from a ``{split: PredictionTable}`` mapping."""
-
-    enriched = frame.copy()
-    # Build unified maps, then delegate to ``add_predictions`` so the
-    # correctness logic stays in one place.
-    merged: dict[str, ClipPrediction] = {}
-    for table in predictions_by_split.values():
-        merged.update(table.by_clip)
-    combined = PredictionTable(
-        by_clip=merged,
-        rows_read=sum(t.rows_read for t in predictions_by_split.values()),
-        blank_predictions=sum(t.blank_predictions for t in predictions_by_split.values()),
-    )
-    return add_predictions(enriched, combined)
-
-
-def merge_prediction_sources(
-    generated: Mapping[str, PredictionTable],
-    csv_table: PredictionTable | None,
-) -> dict[str, PredictionTable]:
-    """Combine model-generated and CSV predictions into one attachable mapping.
-
-    Model-generated predictions win on overlapping clip IDs. The result must be
-    attached in a single ``add_split_predictions`` call: ``add_predictions``
-    reassigns the prediction columns wholesale, so attaching the two sources in
-    sequence would discard whichever was attached first.
-    """
-
-    merged = dict(generated)
-    if csv_table is None:
-        return merged
-    generated_ids = {clip_id for table in generated.values() for clip_id in table.by_clip}
-    csv_only = {
-        clip_id: prediction
-        for clip_id, prediction in csv_table.by_clip.items()
-        if clip_id not in generated_ids
-    }
-    if csv_only:
-        merged["csv"] = PredictionTable(
-            by_clip=csv_only, rows_read=len(csv_only), blank_predictions=0
-        )
-    return merged
 
 
 def _render_prediction_section(train: pd.DataFrame, test: pd.DataFrame) -> None:
@@ -2102,8 +2044,8 @@ def render_background_manifest_status(
 def main() -> None:
     st.title("CUHK-X Small Model Dataset Explorer")
     st.caption(
-        "Explore multimodal samples, inspect predictions and data quality, or run "
-        "the complete training pipeline."
+        "Configure the model workflow once, then inspect predictions alongside "
+        "the multimodal sensor data."
     )
 
     repository_root = REPOSITORY_ROOT
@@ -2111,12 +2053,23 @@ def main() -> None:
     generated_progress = repository_root / "artifacts" / "cuhkx_manifest.progress.json"
     prediction_candidates = discover_prediction_csvs(repository_root)
     default_prediction_csv = str(prediction_candidates[0]) if prediction_candidates else ""
+    default_root = str(resolve_dataset_root())
+    if "prediction_csv_input" not in st.session_state:
+        st.session_state["prediction_csv_input"] = default_prediction_csv
+    if "workflow_prediction_output" not in st.session_state and default_prediction_csv:
+        st.session_state["workflow_prediction_output"] = default_prediction_csv
+    if "workflow_dataset_choice" not in st.session_state:
+        st.session_state["workflow_dataset_choice"] = FULL_DATASET
+    if "workflow_full_dataset_root" not in st.session_state:
+        st.session_state["workflow_full_dataset_root"] = default_root
 
     # A fragment sets this flag when its background builder finishes. Apply
     # widget state before those widgets are instantiated on the next full run.
     if st.session_state.pop("activate_generated_manifest", False):
         st.session_state["saved_manifest_input"] = str(generated_manifest)
         st.session_state["use_manifest_checkbox"] = True
+    if st.session_state.get("page_selector") == "Training pipeline":
+        st.session_state["page_selector"] = "Workflow"
 
     # Page selector is rendered first so dataset-independent pages never trigger
     # dataset I/O or the "Loading dataset manifest…" spinner.
@@ -2125,10 +2078,10 @@ def main() -> None:
         page = st.radio(
             "Page",
             (
+                "Workflow",
                 "Overview",
                 "Clip explorer",
                 "Data quality",
-                "Training pipeline",
                 "Algorithm comparison",
             ),
             key="page_selector",
@@ -2138,8 +2091,8 @@ def main() -> None:
             if st.button("Clear cached index"):
                 st.cache_data.clear()
                 st.rerun()
-        elif page == "Training pipeline":
-            st.caption("Configure and run feature extraction, validation, and model training.")
+        elif page == "Workflow":
+            st.caption("Choose data once, then extract, train, predict, and visualize.")
         else:
             st.caption(
                 "A saved manifest loads instantly; otherwise the first 200 clips "
@@ -2149,24 +2102,34 @@ def main() -> None:
     if page == "Algorithm comparison":
         render_algorithm_comparison()
         return
-    if page == "Training pipeline":
+    if page == "Workflow":
         render_training_pipeline(
             repository_root,
-            str(st.session_state.get("dataset_root_input", resolve_dataset_root())),
+            default_root,
         )
         return
 
     # Only for the three dataset-dependent pages
-    default_root = str(resolve_dataset_root())
     default_manifest = str(generated_manifest) if generated_manifest.is_file() else ""
     if "saved_manifest_input" not in st.session_state:
         st.session_state["saved_manifest_input"] = default_manifest
     if "use_manifest_checkbox" not in st.session_state:
         st.session_state["use_manifest_checkbox"] = True
-    if "prediction_csv_input" not in st.session_state:
-        st.session_state["prediction_csv_input"] = default_prediction_csv
+    root, _workflow_test_csv, sample_selected = workflow_dataset_paths(
+        repository_root, default_root, st.session_state
+    )
+    dataset_root = str(root)
+    st.session_state["dataset_root_input"] = dataset_root
     with st.sidebar:
-        dataset_root = st.text_input("Dataset root", default_root, key="dataset_root_input")
+        st.markdown("**Active workflow**")
+        st.caption(
+            f"Dataset: {'sample' if sample_selected else 'full'} · `{dataset_root}`"
+        )
+
+        def open_workflow() -> None:
+            st.session_state["page_selector"] = "Workflow"
+
+        st.button("Configure workflow", on_click=open_workflow, width="stretch")
         # Pre-filled with the generated parquet when it exists. Clearing the
         # field or unchecking below enables progressive/background rebuilding.
         saved_manifest = st.text_input(
@@ -2174,16 +2137,22 @@ def main() -> None:
         ).strip()
         use_manifest = st.checkbox(
             "Use saved manifest",
-            disabled=not saved_manifest,
-            help="Uncheck to rebuild from the dataset using progressive or blocking loading below.",
+            disabled=not saved_manifest or sample_selected,
+            help=(
+                "Uncheck to rebuild from the dataset. Saved full-dataset manifests "
+                "are not applied to the sample dataset."
+            ),
             key="use_manifest_checkbox",
         )
-        effective_manifest = saved_manifest if use_manifest else ""
+        effective_manifest = saved_manifest if use_manifest and not sample_selected else ""
         progressive = st.checkbox(
             f"Load {INITIAL_CLIP_LIMIT} clips first",
             value=True,
             disabled=bool(effective_manifest),
-            help="Show a representative subset immediately while a complete manifest is built in the background.",
+            help=(
+                "Show a representative subset immediately while a complete "
+                "manifest is built in the background."
+            ),
             key="progressive_loading_checkbox",
         )
         deep_test = st.checkbox(
@@ -2192,78 +2161,11 @@ def main() -> None:
             disabled=bool(effective_manifest),
             key="deep_test_checkbox",
         )
-        st.subheader("Test predictions")
-        prediction_csv = st.text_input(
-            "Predictions CSV (optional)",
-            key="prediction_csv_input",
-            help=(
-                "A path,prediction CSV such as outputs/logreg_submission.csv. "
-                "The newest *_submission.csv under outputs/ is selected automatically."
-            ),
-        ).strip()
-        uploaded_prediction = st.file_uploader(
-            "Or upload predictions CSV",
-            type=("csv",),
-            help="An uploaded file overrides the path above for this session.",
-        )
-
-        st.subheader("Generate predictions")
-        st.caption("Run a saved model to generate predictions for training and test clips.")
-        model_artifacts = discover_model_artifacts(repository_root)
-        if model_artifacts:
-            artifact_options = [str(path) for path in model_artifacts]
-            # Default to the newest artifact.
-            default_artifact = artifact_options[0] if artifact_options else ""
-            if "model_artifact_input" not in st.session_state:
-                st.session_state["model_artifact_input"] = default_artifact
-            selected_model = st.selectbox(
-                "Model artifact",
-                artifact_options,
-                key="model_artifact_input",
-                help="Artifacts from `python -m modeling.train --algorithm <name>` (artifacts/*/model.joblib).",
-            )
-            split_choice = st.selectbox(
-                "Split to predict",
-                ["Both (train + test)", "Train only", "Test only"],
-                key="model_split_choice",
-                help="Generate predictions for the selected split(s). 'Both' enables Overview and Clip explorer visualizations for training and test.",
-            )
-            n_jobs_model = st.number_input(
-                "Parallel jobs",
-                min_value=1,
-                max_value=32,
-                value=4,
-                step=1,
-                key="model_n_jobs",
-                help="Parallelism for feature extraction.",
-            )
-            col_gen, col_clear = st.columns(2)
-            with col_gen:
-                generate_clicked = st.button(
-                    "Generate predictions",
-                    key="generate_model_predictions",
-                    help="Extract features and run the selected model. Uses the current Dataset root.",
-                    width="stretch",
-                )
-            with col_clear:
-                if st.button("Clear generated", key="clear_generated_predictions", width="stretch"):
-                    for key in ("generated_model_predictions", "generated_model_source", "generated_model_split"):
-                        st.session_state.pop(key, None)
-                    st.cache_data.clear()
-                    st.rerun()
-            if generate_clicked:
-                # Store request; actual generation happens after dataset manifest is loaded
-                # so that dataset_root and mapping resolution are consistent.
-                st.session_state["generate_requested"] = {
-                    "model_path": selected_model,
-                    "split_choice": split_choice,
-                    "n_jobs": int(n_jobs_model),
-                    "dataset_root": dataset_root,
-                }
-                st.rerun()
+        prediction_csv = str(st.session_state.get("prediction_csv_input", "")).strip()
+        if prediction_csv:
+            st.caption(f"Predictions: `{prediction_csv}`")
         else:
-            st.caption("No saved models found at `artifacts/*/model.joblib`. Train one with `python -m modeling.train --algorithm logistic_regression`.")
-            generate_clicked = False
+            st.caption("Predictions: none. Create or select them on Workflow.")
 
         if st.button("Clear cached index", key="clear_cache_main"):
             st.cache_data.clear()
@@ -2303,7 +2205,10 @@ def main() -> None:
         st.stop()
 
     if not records:
-        st.error("No clips were found. Check that Training/data or Testing/data exists under the selected root.")
+        st.error(
+            "No clips were found. Check that Training/data or Testing/data exists "
+            "under the selected root."
+        )
         st.stop()
 
     frame = pd.DataFrame(records)
@@ -2313,7 +2218,7 @@ def main() -> None:
     # ------------------------------------------------------------------
     prediction_table: PredictionTable | None = None
     prediction_source = ""
-    if prediction_csv or uploaded_prediction is not None:
+    if prediction_csv:
         mapping_candidates = (
             repository_root / "Training" / "class_mapping.csv",
             root / "Training" / "class_mapping.csv",
@@ -2329,214 +2234,49 @@ def main() -> None:
                 str(mapping_path), mapping_stat.st_mtime_ns, mapping_stat.st_size
             )
             mapping_items = tuple(sorted(action_mapping.items()))
-            if uploaded_prediction is not None:
-                prediction_table = cached_uploaded_predictions(
-                    uploaded_prediction.getvalue(), mapping_items
-                )
-                prediction_source = uploaded_prediction.name
-            else:
-                prediction_path = Path(prediction_csv).expanduser()
-                if not prediction_path.is_absolute():
-                    prediction_path = repository_root / prediction_path
-                prediction_stat = prediction_path.stat()
-                prediction_table = cached_prediction_file(
-                    str(prediction_path),
-                    prediction_stat.st_mtime_ns,
-                    prediction_stat.st_size,
-                    mapping_items,
-                )
-                prediction_source = str(prediction_path)
-            # Defer attaching until after model generation decision so we can merge.
+            prediction_path = Path(prediction_csv).expanduser()
+            if not prediction_path.is_absolute():
+                prediction_path = repository_root / prediction_path
+            prediction_stat = prediction_path.stat()
+            prediction_table = cached_prediction_file(
+                str(prediction_path),
+                prediction_stat.st_mtime_ns,
+                prediction_stat.st_size,
+                mapping_items,
+            )
+            prediction_source = str(prediction_path)
         except Exception as exc:
             st.sidebar.error(f"Could not load predictions: {exc}")
             prediction_table = None
             prediction_source = ""
 
-    # ------------------------------------------------------------------
-    # Model-generated predictions (for training and test)
-    # ------------------------------------------------------------------
-    # If the user requested generation via the sidebar button, run it now.
-    # This is done after the manifest is loaded so that dataset_root is
-    # validated and the action mapping can be resolved consistently.
-    generated_predictions: dict[str, PredictionTable] | None = None
-    generated_source = ""
-    if st.session_state.get("generate_requested") is not None:
-        request = st.session_state.pop("generate_requested")
-        model_path_req = Path(request["model_path"]).expanduser()
-        split_choice_req = request.get("split_choice", "Both (train + test)")
-        n_jobs_req = int(request.get("n_jobs", 4))
-        # Dataset root at generation time may differ from current sidebar value;
-        # use the requested root for reproducibility.
-        dataset_root_req = str(request.get("dataset_root", str(root)))
-        mapping_candidates_gen = (
-            repository_root / "Training" / "class_mapping.csv",
-            Path(dataset_root_req).expanduser() / "Training" / "class_mapping.csv",
-        )
-        mapping_path_gen = next((p for p in mapping_candidates_gen if p.is_file()), None)
-        try:
-            if mapping_path_gen is None:
-                raise FileNotFoundError(
-                    "Training/class_mapping.csv not found in repository or dataset root"
-                )
-            mapping_stat_gen = mapping_path_gen.stat()
-            action_mapping_gen = cached_action_mapping(
-                str(mapping_path_gen), mapping_stat_gen.st_mtime_ns, mapping_stat_gen.st_size
-            )
-            mapping_items_gen = tuple(sorted(action_mapping_gen.items()))
-
-            # Progress bar replaces the previous spinner so the user sees
-            # per-clip extraction progress instead of a static message.
-            progress_bar = st.progress(0, text=f"Generating predictions with {model_path_req.name} — preparing…")
-            # ``st.progress`` is thread-safe when called from the main thread,
-            # which is where ``extract_feature_bundle`` invokes the callback as
-            # it yields results from the ProcessPoolExecutor.
-            def set_progress(percent: int, message: str) -> None:
-                progress_bar.progress(max(0, min(100, int(percent))), text=message)
-
-            def rescale(start: int, span: int) -> Callable[[int, int, str], None]:
-                """Map one split's raw clip counts onto ``start..start+span``."""
-
-                def forward(done: int, total: int, message: str) -> None:
-                    set_progress(start + int(span * done / max(1, total)), message)
-
-                return forward
-
-            def percent_progress(current: int, total: int, message: str) -> None:
-                # ``generate_all_split_predictions`` already reports a monotonic
-                # 0-100 percentage spanning both splits, so pass it straight through.
-                del total
-                set_progress(current, message)
-
-            # Generation runs uncached so the callback can drive the bar during the
-            # ~2 min train extraction (2,785 clips) and ~20 s test extraction (405
-            # clips). The result is persisted in ``st.session_state`` below, which is
-            # what serves subsequent reruns.
-            try:
-                set_progress(2, "Loading model and class mapping…")
-                if split_choice_req in {"Train only", "Test only"}:
-                    only_split = "train" if split_choice_req == "Train only" else "test"
-                    table = generate_predictions_from_model(
-                        str(model_path_req),
-                        dataset_root_req,
-                        None,
-                        dict(mapping_items_gen),
-                        split=only_split,
-                        n_jobs=n_jobs_req,
-                        progress_callback=rescale(5, 90),
-                    )
-                    generated_predictions = {only_split: table}
-                else:
-                    generated_predictions = generate_all_split_predictions(
-                        str(model_path_req),
-                        dataset_root_req,
-                        None,
-                        dict(mapping_items_gen),
-                        n_jobs=n_jobs_req,
-                        progress_callback=percent_progress,
-                    )
-                set_progress(
-                    100,
-                    f"Generated {sum(len(t.by_clip) for t in generated_predictions.values()):,} "
-                    "predictions — complete!",
-                )
-            finally:
-                progress_bar.empty()
-            generated_source = str(model_path_req)
-            # Persist for subsequent reruns (filters, page switches) until cleared.
-            st.session_state["generated_model_predictions"] = generated_predictions
-            st.session_state["generated_model_source"] = generated_source
-            st.session_state["generated_model_split"] = split_choice_req
-            st.success(f"Generated {sum(len(t.by_clip) for t in generated_predictions.values()):,} predictions from {model_path_req.name}")
-        except Exception as exc:
-            st.sidebar.error(f"Could not generate predictions: {exc}")
-            st.error(f"Could not generate predictions: {exc}")
-
-    # Rehydrate previously generated predictions on normal reruns.
-    if generated_predictions is None and "generated_model_predictions" in st.session_state:
-        generated_predictions = st.session_state["generated_model_predictions"]
-        generated_source = st.session_state.get("generated_model_source", "")
-
-    # ------------------------------------------------------------------
-    # Attach predictions to the frame (CSV and/or model-generated)
-    # ------------------------------------------------------------------
-    # Model-generated predictions take precedence over CSV for overlapping IDs.
-    if generated_predictions is not None:
-        # Attach the generated predictions and any non-conflicting CSV entries in a
-        # single pass — see ``merge_prediction_sources``.
-        frame = add_split_predictions(
-            frame, merge_prediction_sources(generated_predictions, prediction_table)
-        )
-        # Report generated predictions
-        total_generated = sum(len(t.by_clip) for t in generated_predictions.values())
-        train_gen = len(generated_predictions.get("train", PredictionTable({}, 0, 0)).by_clip)
-        test_gen = len(generated_predictions.get("test", PredictionTable({}, 0, 0)).by_clip)
-        st.sidebar.caption(
-            f"Generated {total_generated:,} predictions from model {generated_source} "
-            f"(train: {train_gen:,}, test: {test_gen:,}). Matched {train_gen:,} training and {test_gen:,} test clips in current view."
-        )
-        # Keep rendering helpers aware of generated source for download etc.
-        # For downstream reporting, keep prediction_table pointing to the test split if present.
-        if prediction_table is None:
-            prediction_table = generated_predictions.get("test") or next(iter(generated_predictions.values()))
-            prediction_source = generated_source
-        # Provide download for generated test predictions if present.
-        if "test" in generated_predictions:
-            st.sidebar.download_button(
-                "Download generated test CSV",
-                data=prediction_csv_text(generated_predictions["test"]),
-                file_name="generated_test_predictions.csv",
-                mime="text/csv",
-                key="download_generated_test_csv",
-            )
-        if "train" in generated_predictions:
-            csv_train = io.StringIO()
-            writer = csv.DictWriter(csv_train, fieldnames=("clip_id", "true_action_id", "prediction", "predicted_action_name"))
-            writer.writeheader()
-            train_frame = frame[frame["split"] == "train"]
-            for clip_id, pred in generated_predictions["train"].by_clip.items():
-                true_row = train_frame[train_frame["clip_id"] == clip_id]
-                true_id = int(true_row["action_id"].iloc[0]) if not true_row.empty and pd.notna(true_row["action_id"].iloc[0]) else ""
-                writer.writerow(
-                    {
-                        "clip_id": clip_id,
-                        "true_action_id": true_id,
-                        "prediction": int(pred.action_id),
-                        "predicted_action_name": pred.action_name,
-                    }
-                )
-            st.sidebar.download_button(
-                "Download generated train CSV",
-                data=csv_train.getvalue(),
-                file_name="generated_train_predictions.csv",
-                mime="text/csv",
-                key="download_generated_train_csv",
-            )
-    elif prediction_table is not None:
-        # Only CSV predictions — attach them (now supports both train and test IDs).
+    if prediction_table is not None:
         frame = add_predictions(frame, prediction_table)
-        # Report coverage per split for clarity.
-        train_visible = len(set(frame.loc[frame["split"] == "train", "clip_id"].astype(str)) & set(prediction_table.by_clip))
-        test_visible = len(set(frame.loc[frame["split"] == "test", "clip_id"].astype(str)) & set(prediction_table.by_clip))
-        if prediction_csv or uploaded_prediction is not None:
-            if train_visible and test_visible:
-                st.sidebar.caption(
-                    f"Loaded {len(prediction_table.by_clip):,} predictions from {prediction_source}. "
-                    f"Matched {train_visible:,} training and {test_visible:,} test clips in current view."
-                )
-            elif train_visible:
-                st.sidebar.caption(
-                    f"Loaded {len(prediction_table.by_clip):,} predictions from {prediction_source}. "
-                    f"Matched {train_visible:,} training clips."
-                )
-            else:
-                st.sidebar.caption(
-                    f"Loaded {len(prediction_table.by_clip):,} predictions from {prediction_source}. "
-                    f"Matched {test_visible:,}/{len(set(frame.loc[frame['split'] == 'test', 'clip_id'].astype(str))):,} visible test clips."
-                )
-            if prediction_table.blank_predictions:
-                st.sidebar.warning(
-                    f"Ignored {prediction_table.blank_predictions:,} row(s) with blank predictions."
-                )
+        train_visible = len(
+            set(frame.loc[frame["split"] == "train", "clip_id"].astype(str))
+            & set(prediction_table.by_clip)
+        )
+        test_ids = set(frame.loc[frame["split"] == "test", "clip_id"].astype(str))
+        test_visible = len(test_ids & set(prediction_table.by_clip))
+        if train_visible and test_visible:
+            st.sidebar.caption(
+                f"Loaded {len(prediction_table.by_clip):,} predictions from {prediction_source}. "
+                f"Matched {train_visible:,} training and {test_visible:,} test clips in current view."
+            )
+        elif train_visible:
+            st.sidebar.caption(
+                f"Loaded {len(prediction_table.by_clip):,} predictions from {prediction_source}. "
+                f"Matched {train_visible:,} training clips."
+            )
+        else:
+            st.sidebar.caption(
+                f"Loaded {len(prediction_table.by_clip):,} predictions from {prediction_source}. "
+                f"Matched {test_visible:,}/{len(test_ids):,} visible test clips."
+            )
+        if prediction_table.blank_predictions:
+            st.sidebar.warning(
+                f"Ignored {prediction_table.blank_predictions:,} row(s) with blank predictions."
+            )
     if partial_manifest and background_process is not None:
         render_background_manifest_status(
             background_process,

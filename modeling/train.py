@@ -49,6 +49,12 @@ def parse_args(default_algorithm: str = "logistic_regression") -> argparse.Names
         help="Algorithm-independent raw feature cache shared by comparisons.",
     )
     parser.add_argument("--artifacts-dir", type=Path, default=None)
+    parser.add_argument(
+        "--model-output",
+        type=Path,
+        default=None,
+        help="Optional model filename. Defaults to <artifacts-dir>/model.joblib.",
+    )
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--n-jobs", type=int, default=min(8, os.cpu_count() or 1))
     parser.add_argument("--folds", type=int, default=5)
@@ -200,7 +206,11 @@ def _run(args: argparse.Namespace, progress_path: Path | None) -> int:
         else REPOSITORY_ROOT / "outputs" / f"{algorithm.artifact_name}_submission.csv"
     )
     cache_path = args.features_cache.expanduser()
-    model_path = artifacts_dir / "model.joblib"
+    model_path = (
+        args.model_output.expanduser()
+        if args.model_output is not None
+        else artifacts_dir / "model.joblib"
+    )
     report_path = artifacts_dir / "validation.json"
     oof_path = artifacts_dir / "oof_predictions.npz"
 

@@ -80,12 +80,15 @@ def load_action_mapping(path: str | Path) -> dict[int, str]:
 
 
 def parse_prediction_csv(text: str, action_mapping: Mapping[int, str]) -> PredictionTable:
-    """Parse a submission CSV, ignoring rows whose prediction is still blank."""
+    """Parse test-submission or clip-ID predictions, ignoring blank predictions."""
 
     reader = csv.DictReader(io.StringIO(text))
-    required = {"path", "prediction"}
-    if reader.fieldnames is None or not required <= set(reader.fieldnames):
-        raise ValueError("Predictions CSV must contain path and prediction columns")
+    fields = set(reader.fieldnames or ())
+    if "prediction" not in fields or not ({"path", "clip_id"} & fields):
+        raise ValueError(
+            "Predictions CSV must contain prediction and either path or clip_id columns"
+        )
+    identifier_column = "clip_id" if "clip_id" in fields else "path"
 
     predictions: dict[str, ClipPrediction] = {}
     rows_read = 0
@@ -96,11 +99,18 @@ def parse_prediction_csv(text: str, action_mapping: Mapping[int, str]) -> Predic
         if not raw_prediction:
             blank_predictions += 1
             continue
-        submission_path = str(row.get("path", "") or "").strip()
-        try:
-            clip_id = clip_id_from_submission_path(submission_path)
-        except ValueError as exc:
-            raise ValueError(f"Invalid path on prediction row {row_number}") from exc
+        raw_identifier = str(row.get(identifier_column, "") or "").strip()
+        if identifier_column == "clip_id":
+            clip_id = raw_identifier.replace("\\", "/").strip("/")
+            if not clip_id:
+                raise ValueError(f"Invalid clip_id on prediction row {row_number}")
+            submission_path = str(row.get("path", "") or clip_id).strip()
+        else:
+            submission_path = raw_identifier
+            try:
+                clip_id = clip_id_from_submission_path(submission_path)
+            except ValueError as exc:
+                raise ValueError(f"Invalid path on prediction row {row_number}") from exc
         try:
             action_id = int(raw_prediction)
         except ValueError as exc:
@@ -140,17 +150,30 @@ def discover_prediction_csvs(repository_root: str | Path) -> list[Path]:
     outputs = Path(repository_root).expanduser() / "outputs"
     if not outputs.is_dir():
         return []
-    candidates = [path for path in outputs.glob("*_submission.csv") if path.is_file()]
+    candidates: list[Path] = []
+    for path in outputs.glob("*.csv"):
+        if not path.is_file():
+            continue
+        try:
+            with path.open(encoding="utf-8-sig", newline="") as handle:
+                fields = next(csv.reader(handle), [])
+        except OSError:
+            continue
+        normalized_fields = {field.strip() for field in fields}
+        if "prediction" in normalized_fields and (
+            "path" in normalized_fields or "clip_id" in normalized_fields
+        ):
+            candidates.append(path)
     return sorted(candidates, key=lambda path: (path.stat().st_mtime_ns, path.name), reverse=True)
 
 
 def discover_model_artifacts(repository_root: str | Path) -> list[Path]:
-    """Return saved model artifacts (``artifacts/*/model.joblib``), newest first."""
+    """Return saved model artifacts (``artifacts/*/*.joblib``), newest first."""
 
     artifacts_root = Path(repository_root).expanduser() / "artifacts"
     if not artifacts_root.is_dir():
         return []
-    candidates = [path for path in artifacts_root.glob("*/model.joblib") if path.is_file()]
+    candidates = [path for path in artifacts_root.glob("*/*.joblib") if path.is_file()]
     # Also accept a flat layout for backwards compatibility.
     flat = artifacts_root / "model.joblib"
     if flat.is_file():
@@ -420,34 +443,69 @@ def generate_all_split_predictions(
     return {"train": train_table, "test": test_table}
 
 
-def prediction_csv_text(table: PredictionTable) -> str:
-    """Render a ``PredictionTable`` as ``path,prediction`` CSV text.
+def combine_prediction_tables(
+    tables: Mapping[str, PredictionTable],
+) -> PredictionTable:
+    """Combine split-specific prediction tables without losing full clip IDs."""
 
-    The format matches ``parse_prediction_csv`` and the ``modeling.train`` /
-    ``modeling.predict`` submissions. Rows follow the insertion order of
-    ``by_clip``; callers that need test-CSV order should build the table with
-    ``generate_predictions_from_model(split="test")``, which already respects it.
+    combined: dict[str, ClipPrediction] = {}
+    for table in tables.values():
+        overlap = set(combined) & set(table.by_clip)
+        if overlap:
+            duplicate = sorted(overlap)[0]
+            raise ValueError(f"Duplicate prediction for {duplicate}")
+        combined.update(table.by_clip)
+    return PredictionTable(
+        by_clip=combined,
+        rows_read=sum(table.rows_read for table in tables.values()),
+        blank_predictions=sum(table.blank_predictions for table in tables.values()),
+    )
 
-    Note that ``submission_path`` is only round-trippable for the test split:
-    ``clip_id_from_submission_path`` takes the final path component, which
-    recovers ``SM_test_XXXX`` but reduces a training ``<action>/<user>/<trial>``
-    to just the trial.
+
+def prediction_csv_text(
+    table: PredictionTable,
+    *,
+    identifier: str = "path",
+) -> str:
+    """Render a ``PredictionTable`` as a reloadable prediction CSV.
+
+    ``identifier="path"`` preserves the competition submission format and is
+    appropriate for test-only predictions. ``identifier="clip_id"`` preserves
+    hierarchical training IDs and supports train-only or combined files.
     """
 
+    if identifier not in {"path", "clip_id"}:
+        raise ValueError("identifier must be 'path' or 'clip_id'")
     buffer = io.StringIO()
-    writer = csv.DictWriter(buffer, fieldnames=("path", "prediction"))
+    writer = csv.DictWriter(buffer, fieldnames=(identifier, "prediction"))
     writer.writeheader()
     for prediction in table.by_clip.values():
         writer.writerow(
-            {"path": prediction.submission_path, "prediction": int(prediction.action_id)}
+            {
+                identifier: (
+                    prediction.submission_path
+                    if identifier == "path"
+                    else prediction.clip_id
+                ),
+                "prediction": int(prediction.action_id),
+            }
         )
     return buffer.getvalue()
 
 
-def save_prediction_csv(table: PredictionTable, output_path: str | Path) -> Path:
-    """Write a ``PredictionTable`` to a ``path,prediction`` CSV file."""
+def save_prediction_csv(
+    table: PredictionTable,
+    output_path: str | Path,
+    *,
+    identifier: str = "path",
+) -> Path:
+    """Write a prediction table using a submission path or exact clip ID."""
 
     path = Path(output_path).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(prediction_csv_text(table), encoding="utf-8", newline="")
+    path.write_text(
+        prediction_csv_text(table, identifier=identifier),
+        encoding="utf-8",
+        newline="",
+    )
     return path

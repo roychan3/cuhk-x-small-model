@@ -4,19 +4,27 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from dataclasses import replace
+from unittest.mock import MagicMock, patch
 
 from scripts.prepare_sample_dataset import evenly_spaced
 from visualization.training_pipeline import (
+    FULL_DATASET,
+    SAMPLE_DATASET,
     TrainingPipelineConfig,
+    TrainingProcess,
+    adopt_run_outputs,
     build_training_command,
+    model_output_path,
     next_available_run_name,
     overall_progress,
     parse_json_object,
+    reject_submission_name,
     reconcile_orphaned_runs,
     repository_output_path,
     stage_states,
     validate_run_name,
+    workflow_dataset_paths,
 )
 from visualization.progress import COMPLETE, ERROR, RUNNING, mark_error, write_progress
 
@@ -82,6 +90,17 @@ class TrainingPipelineConfigurationTests(unittest.TestCase):
             json.loads(fixed[fixed.index("--parameters") + 1]), {"C": 0.25}
         )
 
+    def test_explicit_model_output_is_forwarded_to_trainer(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model_output = root / "artifacts" / "custom" / "classifier.joblib"
+            command = build_training_command(
+                self._config(root, model_output_path=model_output),
+                root / "progress.json",
+            )
+
+        self.assertEqual(command[command.index("--model-output") + 1], str(model_output))
+
     def test_output_paths_cannot_escape_repository(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
@@ -106,6 +125,30 @@ class TrainingPipelineConfigurationTests(unittest.TestCase):
         self.assertEqual(parse_json_object('{"C": [1]}', "settings"), {"C": [1]})
         with self.assertRaisesRegex(ValueError, "JSON object"):
             parse_json_object("[1, 2]", "settings")
+
+    def test_workflow_dataset_selection_is_shared_by_all_stages(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = Path(temporary).resolve()
+            full_root = repository / "full"
+            sample_root = repository / "artifacts" / "sample_dataset"
+
+            full, full_csv, is_sample = workflow_dataset_paths(
+                repository,
+                full_root,
+                {"workflow_dataset_choice": FULL_DATASET},
+            )
+            self.assertEqual(full, full_root)
+            self.assertEqual(full_csv, repository / "Testing" / "test.csv")
+            self.assertFalse(is_sample)
+
+            sample, sample_csv, is_sample = workflow_dataset_paths(
+                repository,
+                full_root,
+                {"workflow_dataset_choice": SAMPLE_DATASET},
+            )
+            self.assertEqual(sample, sample_root)
+            self.assertEqual(sample_csv, sample_root / "Testing" / "test.csv")
+            self.assertTrue(is_sample)
 
     def test_shared_progress_writer_creates_timestamped_json(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -263,3 +306,126 @@ class OrphanedRunReconciliationTests(unittest.TestCase):
     def test_missing_runs_directory_is_not_an_error(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             self.assertEqual(reconcile_orphaned_runs(Path(temporary)), [])
+
+
+class ModelOutputLocationTests(unittest.TestCase):
+    """The trainer writes validation.json beside the model.
+
+    ``discover_validation_reports`` only globs ``artifacts/*/validation.json``,
+    so a model path of any other depth silently hides the run from the
+    leaderboard — or drops the reports in the checkout root.
+    """
+
+    def test_accepts_the_conventional_run_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            resolved = model_output_path(root, "artifacts/logreg/model.joblib")
+            self.assertEqual(resolved, (root / "artifacts/logreg/model.joblib").resolve())
+            # The derived artifacts dir is what receives validation.json.
+            self.assertEqual(resolved.parent, (root / "artifacts" / "logreg").resolve())
+
+    def test_rejects_a_bare_filename_that_would_write_to_the_checkout_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(ValueError, "artifacts/<run-name>"):
+                model_output_path(Path(temporary), "model.joblib")
+
+    def test_rejects_paths_outside_a_run_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for value in (
+                "outputs/model.joblib",
+                "artifacts/model.joblib",
+                "artifacts/logreg/nested/model.joblib",
+            ):
+                with self.assertRaisesRegex(ValueError, "artifacts/<run-name>"):
+                    model_output_path(root, value)
+
+    def test_still_enforces_the_extension_and_the_repository_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with self.assertRaisesRegex(ValueError, "joblib"):
+                model_output_path(root, "artifacts/logreg/model.pkl")
+            with self.assertRaisesRegex(ValueError, "inside the repository"):
+                model_output_path(root, "/tmp/elsewhere/model.joblib")
+
+
+class CompletedRunOutputAdoptionTests(unittest.TestCase):
+    """A finished run stays on screen while its monitor keeps re-rendering."""
+
+    def _run(self, root: Path, *, write_submission: bool, write_model: bool) -> TrainingProcess:
+        submission = root / "outputs" / "logreg_submission.csv"
+        model = root / "artifacts" / "logreg" / "model.joblib"
+        if write_submission:
+            submission.parent.mkdir(parents=True, exist_ok=True)
+            submission.write_text("path,prediction\n", encoding="utf-8")
+        if write_model:
+            model.parent.mkdir(parents=True, exist_ok=True)
+            model.write_bytes(b"model")
+        config = TrainingPipelineConfig(
+            dataset_root=root,
+            test_csv=root / "Testing" / "test.csv",
+            algorithm="logistic_regression",
+            run_name="logreg",
+            feature_cache=root / "artifacts" / "features" / "f.npz",
+            artifacts_dir=model.parent,
+            output_path=submission,
+        )
+        return TrainingProcess(
+            process=MagicMock(),
+            config=config,
+            run_dir=root / "artifacts" / "training_runs" / "r",
+            log_path=root / "artifacts" / "training_runs" / "r" / "training.log",
+            progress_path=root / "artifacts" / "training_runs" / "r" / "progress.json",
+            metadata_path=root / "artifacts" / "training_runs" / "r" / "run.json",
+            log_handle=MagicMock(),
+            started_at="now",
+            repository_root=root,
+        )
+
+    def test_outputs_are_handed_over_once_then_never_again(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            run = self._run(root, write_submission=True, write_model=True)
+
+            first = adopt_run_outputs(run)
+            self.assertEqual(
+                first["prediction_csv_input"], str(root / "outputs" / "logreg_submission.csv")
+            )
+            self.assertEqual(
+                first["model_artifact_input"], str(root / "artifacts" / "logreg" / "model.joblib")
+            )
+            self.assertEqual(first["workflow_model_path"], first["model_artifact_input"])
+
+            # Later renders must not reclaim the key from a newer selection.
+            self.assertEqual(adopt_run_outputs(run), {})
+            self.assertEqual(adopt_run_outputs(run), {})
+
+    def test_missing_outputs_are_not_advertised(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run = self._run(Path(temporary), write_submission=False, write_model=False)
+            self.assertEqual(adopt_run_outputs(run), {})
+
+    def test_a_custom_model_filename_is_handed_over(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            run = self._run(root, write_submission=False, write_model=False)
+            custom = root / "artifacts" / "logreg" / "best.joblib"
+            custom.parent.mkdir(parents=True, exist_ok=True)
+            custom.write_bytes(b"model")
+            run.config = replace(run.config, model_output_path=custom)
+
+            self.assertEqual(adopt_run_outputs(run)["workflow_model_path"], str(custom))
+
+
+class SubmissionNameGuardTests(unittest.TestCase):
+    def test_test_only_predictions_may_use_the_submission_name(self) -> None:
+        reject_submission_name("Test only", Path("outputs/logreg_submission.csv"))
+
+    def test_any_name_is_fine_for_non_submission_files(self) -> None:
+        for split in ("Test only", "Train only", "Both train and test"):
+            reject_submission_name(split, Path("outputs/logreg_predictions.csv"))
+
+    def test_clip_id_keyed_predictions_cannot_replace_a_submission(self) -> None:
+        for split in ("Train only", "Both train and test"):
+            with self.assertRaisesRegex(ValueError, "not a valid submission"):
+                reject_submission_name(split, Path("outputs/logreg_submission.csv"))

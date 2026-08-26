@@ -129,10 +129,12 @@ This repository includes a Streamlit dashboard with:
   speed, and manual scrubbing controls; playback stays in one browser component
   so advancing a frame does not remount the images or 3D viewers;
 - animated 3D skeletons, IMU magnitude traces, and radar point clouds;
-- a **Training pipeline** page that runs feature extraction, grouped validation,
-  final model fitting, and submission generation in the background with live
-  stage progress and persistent logs;
-- **Generate predictions** directly from any saved `artifacts/*/model.joblib` for **both training and test splits** with a live progress bar (`Extracting training features: X/2,785 → Extracting test features: X/405`), plus `path,prediction` CSV upload/auto-discovery; training predictions are visualized via accuracy, true-vs-predicted confusion matrix, predicted/true distributions and per-clip ✓/✗, test predictions via coverage/distribution/table; `Clip explorer` shows predicted vs true with correctness filters;
+- one **Workflow** page for choosing the sample or full dataset, extracting a
+  named feature cache, training to explicit model/submission paths, and running
+  prediction to a named CSV;
+- automatic handoff of the selected dataset and prediction CSV to **Overview**
+  and **Clip explorer**, where predictions are shown with the synchronized
+  sensor streams;
 - missing-modality, empty-sensor, and timestamp-alignment diagnostics;
 - **Algorithm comparison** page comparing every `artifacts/*/validation.json` (leaderboard, bar chart, confusion matrix + Δ recall, folds, metadata) — same source as `python -m modeling.compare`, and its CSV download is byte-identical to that command's output.
 
@@ -145,12 +147,11 @@ pip install -r requirements.txt
 CUHKX_DATASET_ROOT=/path/to/small-model streamlit run visualization/app.py
 ```
 
-Open **Training pipeline** to select an algorithm and configure the feature
-cache, cross-validation, and run name. Each run writes its reusable feature
-cache under `artifacts/features/`, model/report/OOF files under
-`artifacts/<run-name>/`, submission under `outputs/`, and a timestamped command
-log under `artifacts/training_runs/`. The prediction and algorithm-comparison
-pages discover those files automatically.
+Open **Workflow** and choose **Sample dataset** or **Full dataset** once. The
+same dataset selection is then used by feature extraction, training,
+prediction, Overview, Data quality, and Clip explorer. Each stage has its own
+run button and explicit output path. Background feature/training runs keep live
+progress and timestamped logs under `artifacts/training_runs/`.
 
 For a quick end-to-end check without processing the full dataset, create the
 ignored local fixture once:
@@ -160,20 +161,24 @@ python scripts/prepare_sample_dataset.py --source /path/to/small-model
 ```
 
 This writes an approximately 30 MB, balanced fixture to
-`artifacts/sample_dataset` (8 training clips, 2 test clips). The Training
-pipeline page then offers **Use prepared sample dataset**, which also selects
-two folds, a one-candidate search, and `artifacts/features/ui_sample.npz`.
+`artifacts/sample_dataset` (8 training clips, 2 test clips). Selecting **Sample
+dataset** on Workflow also selects two folds, a one-candidate search, and
+`artifacts/features/ui_sample.npz`.
 
-After `modeling.train` or `modeling.predict` creates a `*_submission.csv` under
-`outputs/`, the dashboard automatically selects the newest one. The sidebar also accepts
-another CSV path or a direct upload. **Or generate predictions without leaving the UI:** in the sidebar **Generate predictions**, pick a saved `artifacts/*/model.joblib` (from `python -m modeling.train --algorithm <name>`), choose `Both (train + test)` / `Train only` / `Test only`, and click **Generate predictions** — a progress bar tracks `Extracting training features: X/2,785` and `Extracting test features: X/405` (via `modeling.features.extract_feature_bundle(progress_callback=…)` → `visualization.predictions.generate_*`), then the model’s predictions are attached to both splits. In `Clip explorer`, training clips show `true · pred · ✓/✗` with predicted-action and correctness filters, test clips show predicted labels; `Overview` shows a training confusion matrix (true vs predicted), accuracy/correct-vs-incorrect, predicted/true distributions, and per-clip tables for both splits, each downloadable as CSV.
+After training, the generated submission is selected automatically. You can
+also choose a model and an exact prediction output filename in Workflow, click
+**Run prediction** for train, test, or both splits, then click **Visualize
+predictions with sensor data**. Test-only output keeps the competition
+`path,prediction` format; train and combined output use `clip_id,prediction` so
+training clip paths remain intact. The saved CSV remains discoverable after
+restarting the dashboard.
 
 ### Dataset root
 
 Every entry point resolves the dataset root the same way, highest precedence
 first:
 
-1. an explicit value — the dashboard sidebar, `--dataset-root`, or the script's
+1. an explicit value — the dashboard Workflow page, `--dataset-root`, or the script's
    first argument;
 2. the `CUHKX_DATASET_ROOT` environment variable;
 3. the built-in default, `~/AAI/opt-scratch/small-model`.
@@ -298,15 +303,15 @@ There are seven suites with different requirements:
 | Suite | Tests | Requires | Behavior without the requirement |
 |-------|-------|----------|----------------------------------|
 | `tests/test_visualization_dataset.py` | 16 | standard library only | always runs |
-| `tests/test_predictions.py` | 7 | standard library only | always runs |
-| `tests/test_training_pipeline.py` | 17 | standard library only | always runs |
+| `tests/test_predictions.py` | 9 | standard library only | always runs |
+| `tests/test_training_pipeline.py` | 29 | standard library only | always runs |
 | `tests/test_comparison_format.py` | 13 | standard library only | always runs; its 2 CLI-parity tests skip without `modeling/requirements.txt` |
-| `tests/test_model_predictions.py` | 36 | artifact discovery and CSV round-tripping need the standard library only; the rest need `numpy`, `visualization/requirements.txt` (for `visualization.app`), or `modeling/requirements.txt` | 5 tests always run; the other 31 skip. Dataset I/O is mocked throughout, so no suite needs the dataset |
+| `tests/test_model_predictions.py` | 32 | artifact discovery and CSV round-tripping need the standard library only; the rest need `numpy`, `visualization/requirements.txt` (for `visualization.app`), or `modeling/requirements.txt` | 5 tests always run; the other 27 skip. Dataset I/O is mocked throughout, so no suite needs the dataset |
 | `tests/test_algorithm_comparison.py` | 19 | `visualization/requirements.txt` + `numpy` (for confusion-matrix math) | collapses to 1 skip |
 | `tests/test_modeling.py` | 27 | `modeling/requirements.txt` | collapses to 1 skip |
 
-So a bare interpreter reports `Ran 91 tests ... OK (skipped=35)`, while an
-interpreter with `visualization` + `modeling` deps reports `Ran 135 tests ... OK`
+So a bare interpreter reports `Ran 101 tests ... OK (skipped=30)`, while an
+interpreter with `visualization` + `modeling` deps reports `Ran 145 tests ... OK`
 (`skipped=1` when the optional real validation artifact is absent). A skip is
 expected, not a failure. Install the extras to run
 everything:

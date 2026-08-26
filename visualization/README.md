@@ -5,8 +5,8 @@ dataset and comparing training algorithms.
 
 ## Contents
 
-- `app.py`: Streamlit application — Overview, Clip explorer, Data quality, Training pipeline, and Algorithm comparison pages.
-- `training_pipeline.py`: background training runner and UI, with repo-local output validation, live stage progress, persistent logs, and reusable saved-run discovery.
+- `app.py`: Streamlit application — Workflow, Overview, Clip explorer, Data quality, and Algorithm comparison pages.
+- `training_pipeline.py`: shared dataset/feature/training/prediction workflow, background training runner, repo-local output validation, live stage progress, persistent logs, and reusable saved-run discovery.
 - `progress.py`: shared atomic JSON progress writer used by manifest building and model training.
 - `algorithm_comparison.py`: Algorithm comparison page (reads `artifacts/*/validation.json` from `modeling.train`/`modeling.compare`; no `scikit-learn` needed).
 - `comparison_format.py`: standard-library-only definition of the comparison table (columns, row builder, run labels), shared with `modeling/compare.py` so the page and the CLI cannot drift.
@@ -47,17 +47,19 @@ CUHKX_DATASET_ROOT=/path/to/small-model streamlit run visualization/app.py
 ```
 
 Use `visualization/requirements.txt` instead when only the read-only dataset
-explorer is needed and the Training pipeline page may remain unavailable.
+explorer is needed and the modeling actions on Workflow may remain unavailable.
 
-### Run the full training pipeline
+### Run the model workflow
 
-Choose **Training pipeline** in the sidebar, select an algorithm, and give the
-run a unique name. The process continues in the background while the page
-shows dataset discovery, feature extraction/cache loading, grouped validation,
-final fitting, and output-saving stages. You can leave the page and return
-without stopping the process.
+Choose **Workflow** in the sidebar. Select **Sample dataset** or **Full
+dataset** once, then use the separate buttons for feature extraction, training,
+and prediction. Each stage exposes its output path on the same page, and
+Overview/Clip explorer automatically use the selected dataset and saved
+prediction CSV. Feature extraction and training continue in the background;
+you can leave the page and return without stopping the process.
 
-Outputs use the same layout as the command-line trainer:
+The default output paths use the command-line layout, but every primary output
+can be renamed on Workflow:
 
 - `artifacts/features/*.npz` for reusable algorithm-independent features;
 - `artifacts/<run-name>/model.joblib`, `validation.json`, and OOF predictions;
@@ -65,8 +67,8 @@ Outputs use the same layout as the command-line trainer:
 - `artifacts/training_runs/<timestamp>-<run-name>/` for the exact command,
   status, structured progress, and full log.
 
-Completed models and reports automatically appear in **Generate predictions**
-and **Algorithm comparison** — the report cache is keyed on each
+Completed models and reports automatically appear in the Workflow prediction
+step and **Algorithm comparison** — the report cache is keyed on each
 `validation.json`'s modification time, so re-using a run name refreshes the
 leaderboard instead of serving the previous run's metrics, and reports written
 by `python -m modeling.train` outside the dashboard are picked up too. The
@@ -85,29 +87,28 @@ python scripts/prepare_sample_dataset.py --source /path/to/small-model
 ```
 
 It creates `artifacts/sample_dataset` with 8 balanced training clips across
-two actions and two users, plus 2 test clips. When that directory exists, the
-page shows **Use prepared sample dataset** and applies settings suitable for a
-fast two-fold smoke test.
+two actions and two users, plus 2 test clips. Select **Sample dataset** on
+Workflow to apply settings suitable for a fast two-fold smoke test.
 
-### Generate predictions and visualize train + test
+### Generate and visualize predictions
 
 Generate predictions **without leaving the dashboard**:
 
-1. Train a model once: `python -m modeling.train --algorithm logistic_regression --dataset-root /path/to/small-model --n-jobs 8` (writes `artifacts/logreg/model.joblib` and `outputs/logreg_submission.csv`).
-2. In the Streamlit sidebar **Generate predictions**, pick a saved `artifacts/*/model.joblib`, choose `Both (train + test)` / `Train only` / `Test only`, and click **Generate predictions**.
-3. A live progress bar tracks extraction per-clip (`Extracting training features: 1,250/2,785` → `Extracting test features: 200/405`, powered by `modeling.features.extract_feature_bundle(progress_callback=…)` → `visualization.predictions.generate_*`), then shows `Generated 3,190 predictions — complete!`. `Both` splits the bar into `train 5→70%` and `test 70→95%` so the ~2 min train extraction and ~20 s test extraction are visible, not a static spinner.
+1. On **Workflow**, choose the dataset.
+2. Train a model or select an existing `.joblib` model in the Prediction step.
+3. Select **Test only**, **Train only**, or **Both train and test**, specify the
+   prediction CSV path, and click **Run prediction**.
+4. Click **Visualize predictions with sensor data** to open Clip explorer.
 
-The dashboard also still reads any `path,prediction` CSV produced by
+Test-only output uses the competition-compatible `path,prediction` schema.
+Train-only and combined output use `clip_id,prediction`, preserving identifiers
+such as `0_Wash_face/user1/1-1-1` when the CSV is reloaded.
+
+The dashboard also reads any `path,prediction` CSV produced by
 `python -m modeling.train` and `python -m modeling.predict`. It automatically
-selects the newest `*_submission.csv` under `outputs/`; use `Predictions CSV`
-in the sidebar to choose another path, or upload a CSV directly (CSV and
-model-generated predictions are merged, with the model taking precedence on
-conflicts, and both are downloadable as `generated_test_predictions.csv` /
-`generated_train_predictions.csv`).
+selects the newest compatible CSV under `outputs/` when a session starts.
 
-For **training** data (where ground truth exists), `Overview → Model predictions` adds training accuracy, correct vs incorrect counts, a true-vs-predicted confusion matrix (true rows, predicted columns), side-by-side predicted/true class distributions, and a per-clip table with `true_action → predicted_action → ✓/✗` (downloadable). `Clip explorer → Train` shows `true · pred · ✓/✗` in the clip selector, with predicted-action and correctness (`Correct only` / `Incorrect only`) filters, and a banner `Predicted: 02 · Drink_water — correct/incorrect (true: …) ✓/✗`.
-
-For **test** data, `Clip explorer` adds a predicted-action filter, includes the
+For test data, `Clip explorer` adds a predicted-action filter, includes the
 action ID/name beside every clip ID, and keeps the selected prediction visible
 above synchronized playback. `Overview` adds prediction coverage, a class
 distribution chart, and a table of every indexed test clip and its prediction.
