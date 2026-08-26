@@ -5,13 +5,19 @@ dataset and comparing training algorithms.
 
 ## Contents
 
-- `app.py`: Streamlit application — Overview, Clip explorer, Data quality, and Algorithm comparison pages.
+- `app.py`: Streamlit application — Overview, Clip explorer, Data quality, Training pipeline, and Algorithm comparison pages.
+- `training_pipeline.py`: background training runner and UI, with repo-local output validation, live stage progress, persistent logs, and reusable saved-run discovery.
+- `progress.py`: shared atomic JSON progress writer used by manifest building and model training.
 - `algorithm_comparison.py`: Algorithm comparison page (reads `artifacts/*/validation.json` from `modeling.train`/`modeling.compare`; no `scikit-learn` needed).
 - `comparison_format.py`: standard-library-only definition of the comparison table (columns, row builder, run labels), shared with `modeling/compare.py` so the page and the CLI cannot drift.
 - `predictions.py`: standard-library prediction CSV validation, clip-ID normalization, action-name mapping, plus `discover_model_artifacts`, `generate_predictions_from_model`, `generate_all_split_predictions` and `save_prediction_csv` for in-UI model inference on both train/test splits with an optional `progress_callback`.
 - `playback.py`: synchronized timeline and playback timing helpers. The clip
   player preloads browser-sized frame assets and advances them client-side, so
   Streamlit does not rebuild the visual tree on every frame.
+
+- `dataset.py`: standard-library dataset discovery, indexing, quality checks, archive access, and manifest generation.
+- `build_manifest.py`: command-line manifest generator.
+- `requirements.txt`: visualization-only Python dependencies.
 
 ### Clip player payload
 
@@ -29,10 +35,6 @@ Radar clips additionally inline `plotly.js` (a few MiB, escaped and cached
 once per process via `_plotly_script`). The player scrolls internally, because
 the host iframe is a fixed height while the layout reflows with viewport width
 and `st.iframe` has no scrolling parameter.
-- `dataset.py`: standard-library dataset discovery, indexing, quality checks, archive access, and manifest generation.
-- `build_manifest.py`: command-line manifest generator.
-- `requirements.txt`: visualization-only Python dependencies.
-
 ## Run locally
 
 From the repository root:
@@ -40,9 +42,52 @@ From the repository root:
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r visualization/requirements.txt
+pip install -r requirements.txt
 CUHKX_DATASET_ROOT=/path/to/small-model streamlit run visualization/app.py
 ```
+
+Use `visualization/requirements.txt` instead when only the read-only dataset
+explorer is needed and the Training pipeline page may remain unavailable.
+
+### Run the full training pipeline
+
+Choose **Training pipeline** in the sidebar, select an algorithm, and give the
+run a unique name. The process continues in the background while the page
+shows dataset discovery, feature extraction/cache loading, grouped validation,
+final fitting, and output-saving stages. You can leave the page and return
+without stopping the process.
+
+Outputs use the same layout as the command-line trainer:
+
+- `artifacts/features/*.npz` for reusable algorithm-independent features;
+- `artifacts/<run-name>/model.joblib`, `validation.json`, and OOF predictions;
+- `outputs/<run-name>_submission.csv` for test predictions;
+- `artifacts/training_runs/<timestamp>-<run-name>/` for the exact command,
+  status, structured progress, and full log.
+
+Completed models and reports automatically appear in **Generate predictions**
+and **Algorithm comparison** — the report cache is keyed on each
+`validation.json`'s modification time, so re-using a run name refreshes the
+leaderboard instead of serving the previous run's metrics, and reports written
+by `python -m modeling.train` outside the dashboard are picked up too. The
+completed submission is also selected as the prediction CSV for the current
+dashboard session.
+
+A run keeps going if the browser session ends, because it is started in its own
+process session. A later session reconciles those: still-running ones can be
+watched and stopped from the page, and records left behind by a session that
+never finalized them are marked `interrupted` rather than staying `running`.
+
+To prepare the lightweight UI fixture from a local full dataset:
+
+```bash
+python scripts/prepare_sample_dataset.py --source /path/to/small-model
+```
+
+It creates `artifacts/sample_dataset` with 8 balanced training clips across
+two actions and two users, plus 2 test clips. When that directory exists, the
+page shows **Use prepared sample dataset** and applies settings suitable for a
+fast two-fold smoke test.
 
 ### Generate predictions and visualize train + test
 
@@ -116,7 +161,7 @@ Progressive loading requires extracted directory sources. ZIP sources fall back 
 
 ### Algorithm comparison
 
-`Algorithm comparison` is the 4th sidebar page and does **not** need the dataset. It discovers every `artifacts/*/validation.json` (one per `python -m modeling.train --algorithm <name>` run) and shows:
+`Algorithm comparison` is a dataset-independent sidebar page. It discovers every `artifacts/*/validation.json` (one per `python -m modeling.train --algorithm <name>` run) and shows:
 
 * Leaderboard sorted by `macro_f1` / `accuracy` / `balanced_accuracy`, with per-algorithm `selected_parameters`, `training_clips`, and `library_versions` warnings. The `Download comparison CSV` button emits `label, algorithm, artifact_name, parameters, accuracy, macro_f1, balanced_accuracy, training_clips, report` — byte-identical to `python -m modeling.compare --output comparison.csv`, because both read `COMPARISON_FIELDS` from `comparison_format.py`. The on-screen table adds `display_name` and leads with whichever metric you sorted by.
 * Metrics bar chart (selected metric or all three)
@@ -161,10 +206,11 @@ python3 -m unittest discover -s tests -t .
 
 ```bash
 docker build -t cuhkx-visualization .
-mkdir -p artifacts
+mkdir -p artifacts outputs
 docker run --rm -p 127.0.0.1:8501:8501 \
   -v /path/to/small-model:/data:ro \
   -v "$(pwd)/artifacts:/app/artifacts" \
+  -v "$(pwd)/outputs:/app/outputs" \
   cuhkx-visualization
 ```
 
@@ -172,8 +218,7 @@ On Linux append `--user "$(id -u):$(id -g)"`; the image runs as uid 10001 and a
 bind mount keeps host ownership, so the background builder cannot otherwise
 write into `artifacts`. Docker Desktop on macOS remaps ownership already.
 
-Open <http://localhost:8501>. The container treats `/data` as the dataset
-root and never copies the dataset into the image. The writable `/app/artifacts`
-mount persists the generated manifest and progress state on the host. Upload a
-prediction CSV in the sidebar, or additionally mount a host output directory
-at `/app/outputs` to enable automatic discovery inside the container.
+Open <http://localhost:8501>. The container treats `/data` as the dataset root
+and never copies the dataset into the image. The writable `/app/artifacts` and
+`/app/outputs` mounts persist generated indexes, training runs, and submissions
+on the host.

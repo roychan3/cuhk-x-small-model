@@ -30,9 +30,12 @@ Given a multimodal clip, predict its action class (`action_id`, **0–39, 40 cla
 │   ├── dataset.py
 │   ├── playback.py
 │   ├── predictions.py
+│   ├── training_pipeline.py
 │   ├── build_manifest.py
 │   └── requirements.txt
 ├── tests/                    # Repository tests
+├── scripts/
+│   └── prepare_sample_dataset.py # compact local UI/training fixture
 ├── Dockerfile                # Visualization container
 ├── Training/
 │   └── class_mapping.csv     # action_id <-> action_name (40 classes)
@@ -126,6 +129,9 @@ This repository includes a Streamlit dashboard with:
   speed, and manual scrubbing controls; playback stays in one browser component
   so advancing a frame does not remount the images or 3D viewers;
 - animated 3D skeletons, IMU magnitude traces, and radar point clouds;
+- a **Training pipeline** page that runs feature extraction, grouped validation,
+  final model fitting, and submission generation in the background with live
+  stage progress and persistent logs;
 - **Generate predictions** directly from any saved `artifacts/*/model.joblib` for **both training and test splits** with a live progress bar (`Extracting training features: X/2,785 → Extracting test features: X/405`), plus `path,prediction` CSV upload/auto-discovery; training predictions are visualized via accuracy, true-vs-predicted confusion matrix, predicted/true distributions and per-clip ✓/✗, test predictions via coverage/distribution/table; `Clip explorer` shows predicted vs true with correctness filters;
 - missing-modality, empty-sensor, and timestamp-alignment diagnostics;
 - **Algorithm comparison** page comparing every `artifacts/*/validation.json` (leaderboard, bar chart, confusion matrix + Δ recall, folds, metadata) — same source as `python -m modeling.compare`, and its CSV download is byte-identical to that command's output.
@@ -138,6 +144,25 @@ source .venv/bin/activate
 pip install -r requirements.txt
 CUHKX_DATASET_ROOT=/path/to/small-model streamlit run visualization/app.py
 ```
+
+Open **Training pipeline** to select an algorithm and configure the feature
+cache, cross-validation, and run name. Each run writes its reusable feature
+cache under `artifacts/features/`, model/report/OOF files under
+`artifacts/<run-name>/`, submission under `outputs/`, and a timestamped command
+log under `artifacts/training_runs/`. The prediction and algorithm-comparison
+pages discover those files automatically.
+
+For a quick end-to-end check without processing the full dataset, create the
+ignored local fixture once:
+
+```bash
+python scripts/prepare_sample_dataset.py --source /path/to/small-model
+```
+
+This writes an approximately 30 MB, balanced fixture to
+`artifacts/sample_dataset` (8 training clips, 2 test clips). The Training
+pipeline page then offers **Use prepared sample dataset**, which also selects
+two folds, a one-candidate search, and `artifacts/features/ui_sample.npz`.
 
 After `modeling.train` or `modeling.predict` creates a `*_submission.csv` under
 `outputs/`, the dashboard automatically selects the newest one. The sidebar also accepts
@@ -186,19 +211,18 @@ symlinks.
 
 ### Docker
 
-The Docker image contains the visualization module only. Mount the dataset
-read-only at `/data` so it is not copied into the image. Mount `artifacts`
-writable so the progressive loader can save `cuhkx_manifest.parquet` and its
-progress file, and so the cache persists after the container is removed. The
-same mount also exposes algorithm reports such as
-`artifacts/logreg/validation.json`:
+The Docker image contains both visualization and modeling dependencies. Mount
+the dataset read-only at `/data` so it is not copied into the image. Mount
+`artifacts` and `outputs` writable so training caches, models, reports, logs,
+and submissions persist after the container is removed:
 
 ```bash
 docker build -t cuhkx-visualization .
-mkdir -p artifacts
+mkdir -p artifacts outputs
 docker run --rm -p 127.0.0.1:8501:8501 \
   -v /path/to/small-model:/data:ro \
   -v "$(pwd)/artifacts:/app/artifacts" \
+  -v "$(pwd)/outputs:/app/outputs" \
   cuhkx-visualization
 ```
 
@@ -207,11 +231,9 @@ bind mount keeps the host directory's ownership, so without it the background
 builder cannot write into `artifacts`. Docker Desktop on macOS remaps ownership
 and needs no extra flag.
 
-Use `:ro` on the artifacts mount only when `cuhkx_manifest.parquet` has already
-been built and the dashboard will only consume existing manifests and
-validation reports. A read-only artifacts mount cannot run progressive cache
-generation or rebuild the manifest; the dashboard reports the failed build
-instead of stopping.
+Use `:ro` on the artifacts mount only when the dashboard will not build an
+index or run training. A read-only artifacts mount cannot create the manifest,
+feature cache, models, validation reports, or training logs.
 
 Then open <http://localhost:8501>. See `visualization/README.md` for the
 module-specific commands and layout. Real scores on 2,785 clips, both measured
@@ -271,19 +293,20 @@ Run it from the repository root:
 python3 -m unittest discover -s tests -t .
 ```
 
-There are six suites with different requirements:
+There are seven suites with different requirements:
 
 | Suite | Tests | Requires | Behavior without the requirement |
 |-------|-------|----------|----------------------------------|
 | `tests/test_visualization_dataset.py` | 16 | standard library only | always runs |
 | `tests/test_predictions.py` | 7 | standard library only | always runs |
+| `tests/test_training_pipeline.py` | 17 | standard library only | always runs |
 | `tests/test_comparison_format.py` | 13 | standard library only | always runs; its 2 CLI-parity tests skip without `modeling/requirements.txt` |
 | `tests/test_model_predictions.py` | 36 | artifact discovery and CSV round-tripping need the standard library only; the rest need `numpy`, `visualization/requirements.txt` (for `visualization.app`), or `modeling/requirements.txt` | 5 tests always run; the other 31 skip. Dataset I/O is mocked throughout, so no suite needs the dataset |
-| `tests/test_algorithm_comparison.py` | 16 | `visualization/requirements.txt` + `numpy` (for confusion-matrix math) | collapses to 1 skip |
-| `tests/test_modeling.py` | 26 | `modeling/requirements.txt` | collapses to 1 skip |
+| `tests/test_algorithm_comparison.py` | 19 | `visualization/requirements.txt` + `numpy` (for confusion-matrix math) | collapses to 1 skip |
+| `tests/test_modeling.py` | 27 | `modeling/requirements.txt` | collapses to 1 skip |
 
-So a bare interpreter reports `Ran 74 tests ... OK (skipped=35)`, while an
-interpreter with `visualization` + `modeling` deps reports `Ran 114 tests ... OK`
+So a bare interpreter reports `Ran 91 tests ... OK (skipped=35)`, while an
+interpreter with `visualization` + `modeling` deps reports `Ran 135 tests ... OK`
 (`skipped=1` when the optional real validation artifact is absent). A skip is
 expected, not a failure. Install the extras to run
 everything:

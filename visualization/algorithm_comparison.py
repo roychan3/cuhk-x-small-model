@@ -17,6 +17,7 @@ import csv
 import io
 import json
 from pathlib import Path
+from collections.abc import Sequence
 from typing import Any
 
 import pandas as pd
@@ -74,10 +75,34 @@ def display_columns(sort_metric: str) -> list[str]:
     return columns
 
 
-@st.cache_data(show_spinner=False)
-def cached_validation_reports(report_paths: tuple[str, ...]) -> list[dict[str, Any]]:
-    reports: list[dict[str, Any]] = []
+def report_cache_keys(report_paths: Sequence[Path | str]) -> tuple[tuple[str, int, int], ...]:
+    """Pair each report with its modification time and size.
+
+    Retraining a run writes ``validation.json`` back to the same path, so a
+    cache keyed on paths alone keeps serving the previous run's metrics. The
+    stat pair is part of the key for the same reason ``cached_saved_manifest``
+    and ``cached_action_mapping`` carry one, and it also picks up reports
+    written by ``python -m modeling.train`` outside the dashboard.
+    """
+
+    keys: list[tuple[str, int, int]] = []
     for raw in report_paths:
+        path = Path(raw)
+        try:
+            stat = path.stat()
+        except OSError:
+            keys.append((str(path), 0, 0))
+            continue
+        keys.append((str(path), stat.st_mtime_ns, stat.st_size))
+    return tuple(keys)
+
+
+@st.cache_data(show_spinner=False)
+def cached_validation_reports(
+    report_keys: tuple[tuple[str, int, int], ...],
+) -> list[dict[str, Any]]:
+    reports: list[dict[str, Any]] = []
+    for raw, _mtime_ns, _size in report_keys:
         path = Path(raw)
         try:
             report = json.loads(path.read_text(encoding="utf-8"))
@@ -289,7 +314,7 @@ def render_algorithm_comparison() -> None:
         )
         st.stop()
 
-    reports = cached_validation_reports(tuple(str(p) for p in report_paths))
+    reports = cached_validation_reports(report_cache_keys(report_paths))
 
     # Surface parse errors inline
     parse_errors = [r for r in reports if "_error" in r]

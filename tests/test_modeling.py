@@ -17,6 +17,7 @@ try:
     from modeling.data import EXPECTED_IMU_DEVICES, discover_training_clips
     from modeling.model import (
         FittedMultimodalModel,
+        _fit_reducers,
         feature_config_from_artifact,
         _majority_vote,
         cross_validate_detailed,
@@ -437,6 +438,21 @@ class AlgorithmRegistryTests(unittest.TestCase):
 
 
 class CrossValidationOutputTests(unittest.TestCase):
+    def test_pca_components_are_capped_for_small_training_sets(self) -> None:
+        rng = np.random.default_rng(4)
+        arrays = {
+            "depth": rng.normal(size=(4, 20)).astype(np.float32),
+            "depth_engineered": rng.normal(size=(4, 6)).astype(np.float32),
+        }
+        # Patch the grid so the assertion pins the clamp, not the tuned values.
+        with patch.dict("modeling.model.PCA_COMPONENTS", {"depth": 64}, clear=True):
+            reducers = _fit_reducers(arrays, np.arange(4), random_state=2)
+
+        # 64 requested, but only 4 training rows are available to fit.
+        self.assertEqual(reducers["depth"].named_steps["pca"].n_components_, 4)
+        # Engineered blocks are passed through rather than projected.
+        self.assertNotIn("pca", reducers["depth_engineered"].named_steps)
+
     def test_repeated_grouped_validation_saves_reusable_oof_outputs(self) -> None:
         rng = np.random.default_rng(11)
         labels = np.tile(np.asarray([0, 1, 0, 1]), 4)
@@ -463,6 +479,7 @@ class CrossValidationOutputTests(unittest.TestCase):
             groups=groups,
         )
         components = {"depth": 2, "imu": 2, "skeleton": 2}
+        progress: list[tuple[int, int]] = []
         with patch.dict("modeling.model.PCA_COMPONENTS", components, clear=True):
             selected, report, outputs = cross_validate_detailed(
                 bundle,
@@ -471,6 +488,7 @@ class CrossValidationOutputTests(unittest.TestCase):
                 n_splits=2,
                 n_repeats=2,
                 random_state=5,
+                progress_callback=lambda done, total: progress.append((done, total)),
             )
 
         self.assertEqual(selected, {"C": 0.1})
@@ -495,6 +513,7 @@ class CrossValidationOutputTests(unittest.TestCase):
         self.assertEqual(outputs.repeat_predictions.shape, (2, len(labels)))
         self.assertIsNotNone(outputs.probabilities)
         self.assertEqual(outputs.probabilities.shape, (len(labels), 2))
+        self.assertEqual(progress, [(1, 4), (2, 4), (3, 4), (4, 4)])
 
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "oof_predictions.npz"

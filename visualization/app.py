@@ -61,6 +61,7 @@ from visualization.predictions import (
     parse_prediction_csv,
     prediction_csv_text,
 )
+from visualization.training_pipeline import render_training_pipeline
 
 st.set_page_config(page_title="CUHK-X Dataset Explorer", page_icon="🧭", layout="wide")
 
@@ -2042,8 +2043,8 @@ def render_background_manifest_status(
             except (OSError, json.JSONDecodeError):
                 pass
 
-            phase = str(progress.get("phase", "starting"))
-            processed = int(progress.get("processed", 0) or 0)
+            phase = str(progress.get("stage", "starting"))
+            processed = int(progress.get("current", 0) or 0)
             total = int(progress.get("total", 0) or 0)
             if phase == "counting":
                 st.progress(
@@ -2101,8 +2102,8 @@ def render_background_manifest_status(
 def main() -> None:
     st.title("CUHK-X Small Model Dataset Explorer")
     st.caption(
-        "Overview, synchronized multimodal samples, predicted test actions, "
-        "and data-quality diagnostics."
+        "Explore multimodal samples, inspect predictions and data quality, or run "
+        "the complete training pipeline."
     )
 
     repository_root = REPOSITORY_ROOT
@@ -2117,16 +2118,28 @@ def main() -> None:
         st.session_state["saved_manifest_input"] = str(generated_manifest)
         st.session_state["use_manifest_checkbox"] = True
 
-    # Page selector is rendered first so "Algorithm comparison" never triggers
+    # Page selector is rendered first so dataset-independent pages never trigger
     # dataset I/O or the "Loading dataset manifest…" spinner.
     with st.sidebar:
         st.header("Data source")
-        page = st.radio("Page", ("Overview", "Clip explorer", "Data quality", "Algorithm comparison"))
+        page = st.radio(
+            "Page",
+            (
+                "Overview",
+                "Clip explorer",
+                "Data quality",
+                "Training pipeline",
+                "Algorithm comparison",
+            ),
+            key="page_selector",
+        )
         if page == "Algorithm comparison":
             st.caption("No dataset scan needed — reads `artifacts/*/validation.json`.")
             if st.button("Clear cached index"):
                 st.cache_data.clear()
                 st.rerun()
+        elif page == "Training pipeline":
+            st.caption("Configure and run feature extraction, validation, and model training.")
         else:
             st.caption(
                 "A saved manifest loads instantly; otherwise the first 200 clips "
@@ -2135,6 +2148,12 @@ def main() -> None:
 
     if page == "Algorithm comparison":
         render_algorithm_comparison()
+        return
+    if page == "Training pipeline":
+        render_training_pipeline(
+            repository_root,
+            str(st.session_state.get("dataset_root_input", resolve_dataset_root())),
+        )
         return
 
     # Only for the three dataset-dependent pages

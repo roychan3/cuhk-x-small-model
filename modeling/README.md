@@ -96,6 +96,16 @@ model, and writes:
   probabilities, repeat predictions, and fold assignments;
 - `outputs/logreg_submission.csv`: predictions in test CSV order.
 
+Pass `--progress-file artifacts/training-progress.json` to publish atomic JSON
+updates for dataset discovery, feature extraction, validation, final fitting,
+and saving. The file carries `status` (`running`/`complete`/`error`), `stage`,
+`current`/`total`, `message`, and `updated_at`, so a reader polling only the
+file can tell a finished run from one that died mid-stage; a failure keeps the
+stage it happened in. `visualization/build_manifest.py --progress-file` writes
+the same schema through the shared `visualization/progress.py` writer. The
+dashboard's **Training pipeline** page uses this interface and keeps one
+progress file plus a complete log for every run.
+
 Override the comparison grid with JSON:
 
 ```bash

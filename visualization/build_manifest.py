@@ -4,10 +4,7 @@
 from __future__ import annotations
 
 import argparse
-import json
-import os
 import sys
-import uuid
 from pathlib import Path
 
 
@@ -19,6 +16,7 @@ from visualization.dataset import (  # noqa: E402
     resolve_dataset_root,
     write_manifest,
 )
+from visualization.progress import COMPLETE, ERROR, RUNNING, mark_error, write_progress  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -57,19 +55,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def write_progress(path: Path | None, **values: object) -> None:
-    if path is None:
-        return
-    path = path.expanduser()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.stem}.{uuid.uuid4().hex}.tmp{path.suffix}")
-    try:
-        temporary.write_text(json.dumps(values, sort_keys=True), encoding="utf-8")
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
 def main() -> int:
     args = parse_args()
     dataset_root = resolve_dataset_root(args.dataset_root)
@@ -77,9 +62,9 @@ def main() -> int:
         def report_progress(phase: str, processed: int, total: int) -> None:
             write_progress(
                 args.progress_file,
-                state="building",
-                phase=phase,
-                processed=processed,
+                status=RUNNING,
+                stage=phase,
+                current=processed,
                 total=total,
             )
 
@@ -92,24 +77,25 @@ def main() -> int:
         if not sources:
             write_progress(
                 args.progress_file,
-                state="error",
+                status=ERROR,
+                stage="discovery",
                 message=f"No dataset sources found under {dataset_root}",
             )
             print(f"No dataset sources found under {dataset_root}", file=sys.stderr)
             return 2
         write_progress(
             args.progress_file,
-            state="building",
-            phase="writing",
-            processed=1,
+            status=RUNNING,
+            stage="writing",
+            current=1,
             total=1,
         )
         output = write_manifest(records, args.output)
         write_progress(
             args.progress_file,
-            state="complete",
-            phase="complete",
-            processed=1,
+            status=COMPLETE,
+            stage="complete",
+            current=1,
             total=1,
             clips=len(records),
         )
@@ -118,7 +104,7 @@ def main() -> int:
         print(f"Sources: {source_summary}")
         return 0
     except Exception as exc:
-        write_progress(args.progress_file, state="error", message=str(exc))
+        mark_error(args.progress_file, str(exc))
         raise
 
 

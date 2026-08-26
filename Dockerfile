@@ -15,12 +15,17 @@ RUN apt-get update \
 
 WORKDIR /app
 
+COPY requirements.txt requirements.txt
 COPY visualization/requirements.txt visualization/requirements.txt
+COPY modeling/requirements.txt modeling/requirements.txt
 RUN python -m pip install --upgrade pip \
-    && python -m pip install -r visualization/requirements.txt
+    && python -m pip install -r requirements.txt
 
 COPY visualization visualization
+COPY modeling modeling
+COPY scripts scripts
 COPY Training/class_mapping.csv Training/class_mapping.csv
+COPY Testing/test.csv Testing/test.csv
 
 RUN useradd --create-home --uid 10001 appuser \
     && chown -R appuser:appuser /app

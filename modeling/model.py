@@ -5,7 +5,7 @@ from __future__ import annotations
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import joblib
 import numpy as np
@@ -85,13 +85,20 @@ class ValidationOutputs:
     repeat_predictions: np.ndarray
 
 
-def _make_reducer(name: str, random_state: int) -> Pipeline:
+def _make_reducer(
+    name: str,
+    random_state: int,
+    *,
+    max_components: int | None = None,
+) -> Pipeline:
     steps: list[tuple[str, Any]] = [
         ("imputer", SimpleImputer(strategy="mean", keep_empty_features=True)),
         ("scaler", StandardScaler()),
     ]
     components = PCA_COMPONENTS.get(name)
     if components is not None:
+        if max_components is not None:
+            components = min(components, max_components)
         steps.append(
             (
                 "pca",
@@ -112,7 +119,11 @@ def _fit_reducers(
 ) -> dict[str, Pipeline]:
     reducers: dict[str, Pipeline] = {}
     for name in arrays:
-        reducer = _make_reducer(name, random_state)
+        reducer = _make_reducer(
+            name,
+            random_state,
+            max_components=min(len(train_indices), arrays[name].shape[1]),
+        )
         reducer.fit(arrays[name][train_indices])
         reducers[name] = reducer
     return reducers
@@ -256,6 +267,7 @@ def cross_validate_detailed(
     n_repeats: int = 1,
     random_state: int = 42,
     selection_metric: str = "macro_f1",
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> tuple[dict[str, Any], dict[str, object], ValidationOutputs]:
     """Evaluate parameters and return reproducible out-of-fold outputs."""
 
@@ -351,6 +363,8 @@ def cross_validate_detailed(
                 f"({len(validation_indices):,} validation clips)",
                 flush=True,
             )
+            if progress_callback is not None:
+                progress_callback(fold, n_splits * n_repeats)
 
     consensus_predictions: list[np.ndarray] = []
     consensus_probabilities: list[np.ndarray | None] = []
@@ -499,7 +513,11 @@ def fit_final_model(
         combined_scaler=scaler,
         classifier=classifier,
         feature_config=feature_config_dict(feature_config),
-        pca_components=dict(PCA_COMPONENTS),
+        pca_components={
+            name: int(reducer.named_steps["pca"].n_components_)
+            for name, reducer in reducers.items()
+            if "pca" in reducer.named_steps
+        },
         algorithm_name=algorithm.name,
         algorithm_parameters=resolved_parameters,
         library_versions=library_versions(),

@@ -29,6 +29,8 @@ try:
         _delta_figure,
         _fold_metric_series,
         _leaderboard_csv,
+        cached_validation_reports,
+        report_cache_keys,
         _row,
         discover_validation_reports,
         display_columns,
@@ -214,6 +216,41 @@ else:
             df = _fold_metric_series(report, "macro_f1")
             self.assertEqual(list(df["fold"]), [1, 2])
             self.assertEqual(list(df["macro_f1"]), [0.5, 0.6])
+
+    class ReportCacheKeyTests(unittest.TestCase):
+        """Retraining rewrites validation.json at the same path."""
+
+        def test_key_changes_when_a_report_is_rewritten(self) -> None:
+            import os
+
+            with tempfile.TemporaryDirectory() as temporary:
+                report = Path(temporary) / "validation.json"
+                report.write_text('{"macro_f1": 0.4}', encoding="utf-8")
+                os.utime(report, ns=(1_000_000_000, 1_000_000_000))
+                before = report_cache_keys([report])
+
+                report.write_text('{"macro_f1": 0.9}', encoding="utf-8")
+                os.utime(report, ns=(2_000_000_000, 2_000_000_000))
+                after = report_cache_keys([report])
+
+            # Same path both times; only the stat pair separates the two runs,
+            # so a path-only key would serve the stale 0.4 report.
+            self.assertEqual(before[0][0], after[0][0])
+            self.assertNotEqual(before, after)
+
+        def test_unreadable_reports_still_produce_a_key(self) -> None:
+            with tempfile.TemporaryDirectory() as temporary:
+                missing = Path(temporary) / "gone" / "validation.json"
+                self.assertEqual(report_cache_keys([missing]), ((str(missing), 0, 0),))
+
+        def test_cached_reports_are_keyed_by_the_stat_tuple(self) -> None:
+            with tempfile.TemporaryDirectory() as temporary:
+                report = Path(temporary) / "validation.json"
+                report.write_text('{"algorithm": "logreg"}', encoding="utf-8")
+                reports = cached_validation_reports(report_cache_keys([report]))
+
+            self.assertEqual(reports[0]["algorithm"], "logreg")
+            self.assertEqual(reports[0]["_path"], str(report))
 
 
 if __name__ == "__main__":

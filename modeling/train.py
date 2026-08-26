@@ -25,6 +25,7 @@ from modeling.model import (
     save_validation_outputs,
 )
 from visualization.dataset import resolve_dataset_root
+from visualization.progress import COMPLETE, RUNNING, mark_error, write_progress
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -75,6 +76,12 @@ def parse_args(default_algorithm: str = "logistic_regression") -> argparse.Names
     parser.add_argument("--rebuild-features", action="store_true")
     parser.add_argument("--extract-only", action="store_true")
     parser.add_argument("--skip-validation", action="store_true")
+    parser.add_argument(
+        "--progress-file",
+        type=Path,
+        default=None,
+        help="Optional JSON status file for dashboard and automation progress.",
+    )
     arguments = parser.parse_args()
     # cross_validate_detailed() rejects these too, but --skip-validation never
     # reaches it, so a nonsense value would otherwise be accepted in silence.
@@ -160,8 +167,27 @@ def _feature_health(
 
 def main(default_algorithm: str = "logistic_regression") -> int:
     args = parse_args(default_algorithm)
+    progress_path = args.progress_file.expanduser() if args.progress_file is not None else None
+    try:
+        return _run(args, progress_path)
+    except Exception as exc:
+        # A reader polling only the progress file cannot see the exit status,
+        # so the failure has to be recorded before the traceback propagates.
+        # A hard kill still leaves the file mid-stage; `updated_at` is what
+        # reveals that.
+        mark_error(progress_path, f"{type(exc).__name__}: {exc}")
+        raise
+
+
+def _run(args: argparse.Namespace, progress_path: Path | None) -> int:
     algorithm = get_algorithm(args.algorithm)
     dataset_root = resolve_dataset_root(args.dataset_root)
+    write_progress(
+        progress_path,
+        status=RUNNING,
+        stage="discovery",
+        message="Discovering training and test clips",
+    )
     config = FeatureConfig()
     artifacts_dir = (
         args.artifacts_dir.expanduser()
@@ -195,6 +221,15 @@ def main(default_algorithm: str = "logistic_regression") -> int:
         f"from {min(counts.values())} to {max(counts.values())}."
     )
     print(f"Test clips: {len(test_records):,}")
+    total_feature_clips = len(training_records) + len(test_records)
+    write_progress(
+        progress_path,
+        status=RUNNING,
+        stage="features",
+        message="Preparing the shared feature cache",
+        current=0,
+        total=total_feature_clips,
+    )
 
     train_bundle: RawFeatureBundle
     test_bundle: RawFeatureBundle
@@ -210,23 +245,76 @@ def main(default_algorithm: str = "logistic_regression") -> int:
             ):
                 raise ValueError("Feature cache clip order does not match discovered clips")
             print(f"Loaded shared feature cache: {cache_path}")
+            write_progress(
+                progress_path,
+                status=RUNNING,
+                stage="features",
+                message="Loaded the compatible shared feature cache",
+                current=total_feature_clips,
+                total=total_feature_clips,
+            )
         except (KeyError, OSError, ValueError) as exc:
             print(f"Ignoring incompatible feature cache: {exc}")
             use_cache = False
 
     if not use_cache:
         print("Extracting training features...")
-        train_bundle = extract_feature_bundle(training_records, config, n_jobs=args.n_jobs)
+        train_bundle = extract_feature_bundle(
+            training_records,
+            config,
+            n_jobs=args.n_jobs,
+            progress_callback=lambda done, total: write_progress(
+                progress_path,
+                status=RUNNING,
+                stage="features",
+                message=f"Extracting training features: {done:,}/{total:,}",
+                current=done,
+                total=total_feature_clips,
+            ),
+        )
         print("Extracting test features...")
-        test_bundle = extract_feature_bundle(test_records, config, n_jobs=args.n_jobs)
+        test_bundle = extract_feature_bundle(
+            test_records,
+            config,
+            n_jobs=args.n_jobs,
+            progress_callback=lambda done, total: write_progress(
+                progress_path,
+                status=RUNNING,
+                stage="features",
+                message=f"Extracting test features: {done:,}/{total:,}",
+                current=len(training_records) + done,
+                total=total_feature_clips,
+            ),
+        )
         save_feature_cache(cache_path, train_bundle, test_bundle, config)
         print(f"Saved shared feature cache: {cache_path}")
+        write_progress(
+            progress_path,
+            status=RUNNING,
+            stage="features",
+            message="Saved the shared feature cache",
+            current=total_feature_clips,
+            total=total_feature_clips,
+        )
 
     test_feature_health = _feature_health(train_bundle, test_bundle)
     if args.extract_only:
+        write_progress(
+            progress_path,
+            status=COMPLETE,
+            stage="complete",
+            message="Feature extraction complete",
+            outputs={"feature_cache": str(cache_path)},
+        )
         return 0
 
     if args.skip_validation:
+        write_progress(
+            progress_path,
+            status=RUNNING,
+            stage="validation",
+            message="Skipping cross-validation",
+        )
         selected_parameters = algorithm.resolved_parameters(
             _parse_json_mapping(args.parameters, "--parameters")
         )
@@ -239,6 +327,15 @@ def main(default_algorithm: str = "logistic_regression") -> int:
         }
     else:
         candidates = algorithm.parameter_candidates(_search_space(args.search_space))
+        validation_steps = args.folds * args.cv_repeats
+        write_progress(
+            progress_path,
+            status=RUNNING,
+            stage="validation",
+            message="Running participant-grouped cross-validation",
+            current=0,
+            total=validation_steps,
+        )
         selected_parameters, report, validation_outputs = cross_validate_detailed(
             train_bundle,
             algorithm,
@@ -247,6 +344,14 @@ def main(default_algorithm: str = "logistic_regression") -> int:
             n_repeats=args.cv_repeats,
             random_state=args.random_state,
             selection_metric=args.selection_metric,
+            progress_callback=lambda done, total: write_progress(
+                progress_path,
+                status=RUNNING,
+                stage="validation",
+                message=f"Completed validation fold {done:,}/{total:,}",
+                current=done,
+                total=total,
+            ),
         )
         print(
             f"Selected parameters by {args.selection_metric}: "
@@ -276,6 +381,12 @@ def main(default_algorithm: str = "logistic_regression") -> int:
     report_path.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
 
     print("Fitting final model...")
+    write_progress(
+        progress_path,
+        status=RUNNING,
+        stage="training",
+        message="Fitting the final model",
+    )
     model = fit_final_model(
         train_bundle,
         algorithm,
@@ -284,6 +395,12 @@ def main(default_algorithm: str = "logistic_regression") -> int:
         random_state=args.random_state,
     )
     save_model(model, model_path)
+    write_progress(
+        progress_path,
+        status=RUNNING,
+        stage="saving",
+        message="Generating and saving test predictions",
+    )
     predictions = model.predict(test_bundle)
     assert test_bundle.submission_paths is not None
     _write_submission(output_path, test_bundle.submission_paths, predictions)
@@ -292,6 +409,21 @@ def main(default_algorithm: str = "logistic_regression") -> int:
     if validation_outputs is not None:
         print(f"Saved out-of-fold predictions: {oof_path}")
     print(f"Saved submission: {output_path}")
+    outputs = {
+        "feature_cache": str(cache_path),
+        "model": str(model_path),
+        "validation_report": str(report_path),
+        "submission": str(output_path),
+    }
+    if validation_outputs is not None:
+        outputs["oof_predictions"] = str(oof_path)
+    write_progress(
+        progress_path,
+        status=COMPLETE,
+        stage="complete",
+        message="Training pipeline complete",
+        outputs=outputs,
+    )
     return 0
 
 
