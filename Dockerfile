@@ -28,7 +28,9 @@ COPY Training/class_mapping.csv Training/class_mapping.csv
 COPY Testing/test.csv Testing/test.csv
 
 RUN useradd --create-home --uid 10001 appuser \
-    && chown -R appuser:appuser /app
+    && mkdir -p /app/artifacts /app/outputs \
+    && chown -R appuser:appuser /app \
+    && chmod +x /app/scripts/docker-entrypoint.sh
 
 USER appuser
 
@@ -37,4 +39,6 @@ EXPOSE 8501
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health', timeout=3)"
 
+ENTRYPOINT ["/app/scripts/docker-entrypoint.sh"]
+# Kept as CMD so `docker run <image> bash` still works for debugging.
 CMD ["streamlit", "run", "visualization/app.py"]

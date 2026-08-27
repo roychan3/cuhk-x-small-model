@@ -219,7 +219,10 @@ symlinks.
 The Docker image contains both visualization and modeling dependencies. Mount
 the dataset read-only at `/data` so it is not copied into the image. Mount
 `artifacts` and `outputs` writable so training caches, models, reports, logs,
-and submissions persist after the container is removed:
+and submissions persist after the container is removed. On first start the
+container auto-prepares `artifacts/sample_dataset` from `/data` so **Workflow
+→ Sample dataset** is immediately usable (no manual `prepare_sample_dataset.py`
+needed) and `/data` is ready for **Full dataset**:
 
 ```bash
 docker build -t cuhkx-visualization .
@@ -229,6 +232,7 @@ docker run --rm -p 127.0.0.1:8501:8501 \
   -v "$(pwd)/artifacts:/app/artifacts" \
   -v "$(pwd)/outputs:/app/outputs" \
   cuhkx-visualization
+# logs: [entrypoint] Preparing sample dataset from /data ... Sample dataset ready
 ```
 
 On Linux add `--user "$(id -u):$(id -g)"`. The image runs as uid 10001, and a
