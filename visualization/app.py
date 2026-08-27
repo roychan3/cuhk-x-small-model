@@ -371,196 +371,6 @@ def add_predictions(frame: pd.DataFrame, predictions: PredictionTable) -> pd.Dat
     return enriched
 
 
-def _render_prediction_section(train: pd.DataFrame, test: pd.DataFrame) -> None:
-    """Render prediction visualizations for both training and test splits."""
-
-    has_train_preds = "prediction_action_id" in train.columns and not train.dropna(
-        subset=["prediction_action_id"]
-    ).empty
-    has_test_preds = "prediction_action_id" in test.columns and not test.dropna(subset=["prediction_action_id"]).empty
-
-    if not has_train_preds and not has_test_preds:
-        return
-
-    st.subheader("Model predictions")
-
-    if has_train_preds and has_test_preds:
-        train_pred = train.dropna(subset=["prediction_action_id"]).copy()
-        test_pred = test.dropna(subset=["prediction_action_id"]).copy()
-        cols = st.columns(4)
-        cols[0].metric("Train predicted", f"{len(train_pred):,} / {len(train):,}")
-        accuracy = float((train_pred["prediction_action_id"].astype(int) == train_pred["action_id"].astype(int)).mean()) if len(
-            train_pred
-        ) else 0.0
-        cols[1].metric("Train accuracy", f"{accuracy:.1%}")
-        cols[2].metric("Test predicted", f"{len(test_pred):,} / {len(test):,}")
-        cols[3].metric("Predicted actions (test)", int(test_pred["prediction_action_id"].nunique()))
-    elif has_test_preds:
-        predicted = test.dropna(subset=["prediction_action_id"]).copy()
-        prediction_metrics = st.columns(3)
-        prediction_metrics[0].metric("Predicted clips", f"{len(predicted):,}")
-        prediction_metrics[1].metric(
-            "Visible coverage",
-            f"{len(predicted) / len(test):.1%}" if len(test) else "—",
-        )
-        prediction_metrics[2].metric(
-            "Predicted actions",
-            int(predicted["prediction_action_id"].nunique()),
-        )
-    elif has_train_preds:
-        train_pred = train.dropna(subset=["prediction_action_id"]).copy()
-        cols = st.columns(3)
-        cols[0].metric("Predicted training clips", f"{len(train_pred):,} / {len(train):,}")
-        accuracy = float((train_pred["prediction_action_id"].astype(int) == train_pred["action_id"].astype(int)).mean()) if len(
-            train_pred
-        ) else 0.0
-        cols[1].metric("Training accuracy", f"{accuracy:.1%}")
-        cols[2].metric("Predicted actions", int(train_pred["prediction_action_id"].nunique()))
-
-    # Training-specific visualizations
-    if has_train_preds:
-        train_pred = train.dropna(subset=["prediction_action_id"]).copy()
-        # Accuracy and correctness breakdown
-        correct = (train_pred["prediction_action_id"].astype(int) == train_pred["action_id"].astype(int)).sum()
-        incorrect = len(train_pred) - int(correct)
-        st.markdown("**Training predictions — correctness**")
-        c1, c2 = st.columns(2)
-        with c1:
-            acc = float(correct / len(train_pred)) if len(train_pred) else 0.0
-            st.metric("Correct", f"{int(correct):,} ({acc:.1%})")
-        with c2:
-            st.metric("Incorrect", f"{int(incorrect):,}")
-
-        # Confusion-matrix style heatmap: true vs predicted
-        try:
-            true_ids = train_pred["action_id"].astype(int)
-            pred_ids = train_pred["prediction_action_id"].astype(int)
-            all_ids = sorted(set(true_ids) | set(pred_ids))
-            # Build confusion matrix manually to avoid sklearn dependency if missing.
-            import numpy as np
-
-            id_to_pos = {aid: i for i, aid in enumerate(all_ids)}
-            matrix = np.zeros((len(all_ids), len(all_ids)), dtype=int)
-            for t, p in zip(true_ids, pred_ids, strict=True):
-                matrix[id_to_pos[int(t)], id_to_pos[int(p)]] += 1
-            # Labels for display; one pass over the frame instead of a filter per class.
-            name_by_id = dict(zip(true_ids, train_pred["action_name"], strict=True))
-            labels = [pretty_action(name_by_id[aid]) if aid in name_by_id else str(aid) for aid in all_ids]
-            fig = go.Figure(
-                data=go.Heatmap(
-                    z=matrix,
-                    x=labels,
-                    y=labels,
-                    colorscale="Blues",
-                    colorbar_title="count",
-                    hovertemplate="true=%{y}<br>pred=%{x}<br>count=%{z}<extra></extra>",
-                )
-            )
-            fig.update_layout(
-                title="Training confusion matrix (true vs predicted)",
-                xaxis_title="Predicted",
-                yaxis_title="True",
-                height=520,
-                xaxis={"tickangle": -45},
-                yaxis={"autorange": "reversed"},
-            )
-            st.plotly_chart(fig, width="stretch")
-            st.caption("Rows = true action, columns = predicted. Only training clips with a prediction are shown.")
-        except Exception as exc:
-            st.warning(f"Could not render the training confusion matrix: {exc}")
-
-        # Distribution of predicted vs true for training
-        pred_dist = (
-            train_pred.groupby(["prediction_action_id", "prediction_action_name"], dropna=False)
-            .size()
-            .reset_index(name="clips")
-            .sort_values("prediction_action_id")
-        )
-        pred_dist["action"] = pred_dist.apply(
-            lambda row: prediction_label(row["prediction_action_id"], row["prediction_action_name"]),
-            axis=1,
-        )
-        true_dist = (
-            train_pred.groupby(["action_id", "action_name"], dropna=False)
-            .size()
-            .reset_index(name="clips")
-            .sort_values("action_id")
-        )
-        true_dist["action"] = true_dist["action_name"].map(pretty_action)
-        # Side-by-side bar comparison
-        c1, c2 = st.columns(2)
-        with c1:
-            fig = px.bar(pred_dist, x="action", y="clips", color="clips", color_continuous_scale="Teal", title="Predicted distribution (train)")
-            fig.update_layout(xaxis_tickangle=-55, coloraxis_showscale=False, height=430)
-            st.plotly_chart(fig, width="stretch")
-        with c2:
-            fig = px.bar(true_dist, x="action", y="clips", color="clips", color_continuous_scale="Blues", title="True distribution (train)")
-            fig.update_layout(xaxis_tickangle=-55, coloraxis_showscale=False, height=430)
-            st.plotly_chart(fig, width="stretch")
-
-        with st.expander("Predictions by training clip"):
-            prediction_rows = train[["clip_id", "action_id", "action_name", "prediction_action_id", "prediction_action_name"]].copy()
-            prediction_rows = prediction_rows.sort_values("clip_id")
-            prediction_rows["true_action"] = prediction_rows.apply(
-                lambda row: prediction_label(row["action_id"], row["action_name"]) if pd.notna(row["action_id"]) else "Unknown",
-                axis=1,
-            )
-            prediction_rows["predicted_action"] = prediction_rows.apply(
-                lambda row: prediction_label(row["prediction_action_id"], row["prediction_action_name"]) if pd.notna(row["prediction_action_id"]) else "No prediction",
-                axis=1,
-            )
-            prediction_rows["correct"] = prediction_rows.apply(
-                lambda row: "✓" if pd.notna(row["prediction_action_id"]) and row["prediction_action_id"] == row["action_id"] else ("✗" if pd.notna(row["prediction_action_id"]) else "—"),
-                axis=1,
-            )
-            st.dataframe(
-                prediction_rows[["clip_id", "true_action", "predicted_action", "correct"]],
-                hide_index=True,
-                width="stretch",
-            )
-
-    if has_test_preds:
-        predicted = test.dropna(subset=["prediction_action_id"]).copy()
-        distribution = (
-            predicted.groupby(["prediction_action_id", "prediction_action_name"], dropna=False)
-            .size()
-            .reset_index(name="clips")
-            .sort_values("prediction_action_id")
-        )
-        distribution["action"] = distribution.apply(
-            lambda row: prediction_label(row["prediction_action_id"], row["prediction_action_name"]),
-            axis=1,
-        )
-        st.markdown("**Test predictions — distribution**")
-        figure = px.bar(
-            distribution,
-            x="action",
-            y="clips",
-            color="clips",
-            color_continuous_scale="Teal",
-        )
-        figure.update_layout(xaxis_tickangle=-55, coloraxis_showscale=False, height=430)
-        st.plotly_chart(figure, width="stretch")
-
-        with st.expander("Predictions by test clip"):
-            prediction_rows = test[["clip_id", "prediction_action_id", "prediction_action_name"]].sort_values("clip_id")
-            prediction_rows = prediction_rows.rename(
-                columns={
-                    "prediction_action_id": "action_id",
-                    "prediction_action_name": "action_name",
-                }
-            )
-            prediction_rows["action"] = prediction_rows.apply(
-                lambda row: prediction_label(row["action_id"], row["action_name"]) if pd.notna(row["action_id"]) else "No prediction",
-                axis=1,
-            )
-            st.dataframe(
-                prediction_rows[["clip_id", "action_id", "action"]],
-                hide_index=True,
-                width="stretch",
-            )
-
-
 def render_overview(frame: pd.DataFrame) -> None:
     st.header("Dataset overview")
     train = frame[frame["split"] == "train"].copy()
@@ -572,8 +382,6 @@ def render_overview(frame: pd.DataFrame) -> None:
     metric_columns[2].metric("Actions", int(train["action_id"].nunique()) if not train.empty else 0)
     metric_columns[3].metric("Users", int(train["user"].nunique()) if not train.empty else 0)
     metric_columns[4].metric("All modalities", f"{complete / len(frame):.1%}" if len(frame) else "—")
-
-    _render_prediction_section(train, test)
 
     left, right = st.columns((1.45, 1))
     with left:
@@ -1722,8 +1530,137 @@ def render_clip_player(
         )
 
 
-def render_clip_explorer(frame: pd.DataFrame, sources: dict[str, dict[str, str]]) -> None:
+NO_PREDICTION_OPTION = ""
+
+
+def prediction_file_options(
+    candidates: Iterable[Path],
+    handoff: str,
+    repository_root: Path,
+) -> tuple[list[str], str]:
+    """Return the picker's options and the value a fresh hand-off should select.
+
+    ``handoff`` is ``prediction_csv_input``, written by the Workflow page. It is
+    normalized to an absolute path so it can be compared with the discovered
+    candidates, and included as an option even when it lives outside
+    ``outputs/`` — discovery only scans that folder, but Workflow may write
+    anywhere in the repository.
+    """
+
+    options = [NO_PREDICTION_OPTION, *(str(path) for path in candidates)]
+    resolved = ""
+    if handoff.strip():
+        path = Path(handoff.strip()).expanduser()
+        if not path.is_absolute():
+            path = repository_root / path
+        resolved = str(path)
+        if resolved not in options and path.is_file():
+            options.insert(1, resolved)
+    if resolved in options:
+        return options, resolved
+    return options, options[1] if len(options) > 1 else NO_PREDICTION_OPTION
+
+
+def _select_prediction_file(candidates: list[Path]) -> str:
+    """Render the explorer's prediction picker and return the chosen path.
+
+    The choice is deliberately local to the clip explorer, but a prediction the
+    user just produced on Workflow should still win. Re-applying the hand-off on
+    every render would fight the dropdown, and applying it only when the key is
+    unset would ignore every later hand-off, so it is applied whenever the
+    hand-off value itself changes.
+    """
+
+    handoff = str(st.session_state.get("prediction_csv_input", "")).strip()
+    options, default = prediction_file_options(candidates, handoff, REPOSITORY_ROOT)
+
+    if st.session_state.get("prediction_handoff_applied") != handoff:
+        st.session_state["prediction_handoff_applied"] = handoff
+        st.session_state["clip_explorer_prediction_file"] = default
+    # A previously chosen file may since have been deleted or renamed.
+    if st.session_state.setdefault("clip_explorer_prediction_file", default) not in options:
+        st.session_state["clip_explorer_prediction_file"] = default
+
+    selected = st.selectbox(
+        "Prediction file",
+        options,
+        format_func=lambda value: Path(value).name if value else "(No predictions)",
+        key="clip_explorer_prediction_file",
+        help="Prediction CSVs discovered under outputs/, newest first. This choice affects only the clip explorer.",
+    )
+    if selected:
+        st.caption(f"Selected predictions: `{selected}`")
+    elif candidates:
+        st.caption("No prediction file selected — the explorer shows ground truth only.")
+    else:
+        st.caption("No compatible prediction CSV files found in `outputs/`.")
+    return str(selected)
+
+
+def _apply_predictions(frame: pd.DataFrame, prediction_path: Path) -> pd.DataFrame:
+    """Attach one prediction CSV to a copy of the frame and report its coverage."""
+
+    dataset_hint = str(st.session_state.get("dataset_root_input", "")).strip()
+    mapping_candidates = [REPOSITORY_ROOT / "Training" / "class_mapping.csv"]
+    if dataset_hint:
+        mapping_candidates.append(Path(dataset_hint).expanduser() / "Training" / "class_mapping.csv")
+    mapping_path = next((path for path in mapping_candidates if path.is_file()), None)
+    if mapping_path is None:
+        raise FileNotFoundError(
+            "Training/class_mapping.csv was not found in the repository or dataset root"
+        )
+    mapping_stat = mapping_path.stat()
+    action_mapping = cached_action_mapping(
+        str(mapping_path), mapping_stat.st_mtime_ns, mapping_stat.st_size
+    )
+    prediction_stat = prediction_path.stat()
+    table = cached_prediction_file(
+        str(prediction_path),
+        prediction_stat.st_mtime_ns,
+        prediction_stat.st_size,
+        tuple(sorted(action_mapping.items())),
+    )
+
+    enriched = add_predictions(frame, table)
+    clip_ids = {
+        split: set(enriched.loc[enriched["split"] == split, "clip_id"].astype(str))
+        for split in ("train", "test")
+    }
+    matched = {
+        split: len(ids & set(table.by_clip)) for split, ids in clip_ids.items()
+    }
+    parts = [f"{count:,} {split}" for split, count in matched.items() if count]
+    summary = " and ".join(parts) if parts else "no visible"
+    st.caption(
+        f"Loaded {len(table.by_clip):,} predictions from `{prediction_path}` · "
+        f"matched {summary} clips in the current view."
+    )
+    if table.blank_predictions:
+        st.warning(
+            f"Ignored {table.blank_predictions:,} row(s) with blank predictions."
+        )
+    return enriched
+
+
+def render_clip_explorer(
+    frame: pd.DataFrame,
+    sources: dict[str, dict[str, str]],
+    prediction_candidates: list[Path],
+) -> None:
     st.header("Multimodal clip explorer")
+
+    # Prediction choice is local to this page, so Overview and Data quality are
+    # unaffected by it.
+    prediction_csv = _select_prediction_file(prediction_candidates)
+    # Enrich a local copy so Overview and Data quality stay prediction-free.
+    explorer_frame = frame
+    if prediction_csv:
+        try:
+            explorer_frame = _apply_predictions(frame, Path(prediction_csv))
+        except Exception as exc:
+            st.error(f"Could not load predictions: {exc}")
+    # From here on the explorer works on the enriched local copy.
+    frame = explorer_frame
     splits = [split for split in ("test", "train") if split in set(frame["split"]) and split in sources]
     if not splits:
         st.warning("No indexed split is available.")
@@ -2161,11 +2098,6 @@ def main() -> None:
             disabled=bool(effective_manifest),
             key="deep_test_checkbox",
         )
-        prediction_csv = str(st.session_state.get("prediction_csv_input", "")).strip()
-        if prediction_csv:
-            st.caption(f"Predictions: `{prediction_csv}`")
-        else:
-            st.caption("Predictions: none. Create or select them on Workflow.")
 
         if st.button("Clear cached index", key="clear_cache_main"):
             st.cache_data.clear()
@@ -2213,70 +2145,8 @@ def main() -> None:
 
     frame = pd.DataFrame(records)
 
-    # ------------------------------------------------------------------
-    # CSV-based predictions (test and optionally train)
-    # ------------------------------------------------------------------
-    prediction_table: PredictionTable | None = None
-    prediction_source = ""
-    if prediction_csv:
-        mapping_candidates = (
-            repository_root / "Training" / "class_mapping.csv",
-            root / "Training" / "class_mapping.csv",
-        )
-        mapping_path = next((path for path in mapping_candidates if path.is_file()), None)
-        try:
-            if mapping_path is None:
-                raise FileNotFoundError(
-                    "Training/class_mapping.csv was not found in the repository or dataset root"
-                )
-            mapping_stat = mapping_path.stat()
-            action_mapping = cached_action_mapping(
-                str(mapping_path), mapping_stat.st_mtime_ns, mapping_stat.st_size
-            )
-            mapping_items = tuple(sorted(action_mapping.items()))
-            prediction_path = Path(prediction_csv).expanduser()
-            if not prediction_path.is_absolute():
-                prediction_path = repository_root / prediction_path
-            prediction_stat = prediction_path.stat()
-            prediction_table = cached_prediction_file(
-                str(prediction_path),
-                prediction_stat.st_mtime_ns,
-                prediction_stat.st_size,
-                mapping_items,
-            )
-            prediction_source = str(prediction_path)
-        except Exception as exc:
-            st.sidebar.error(f"Could not load predictions: {exc}")
-            prediction_table = None
-            prediction_source = ""
-
-    if prediction_table is not None:
-        frame = add_predictions(frame, prediction_table)
-        train_visible = len(
-            set(frame.loc[frame["split"] == "train", "clip_id"].astype(str))
-            & set(prediction_table.by_clip)
-        )
-        test_ids = set(frame.loc[frame["split"] == "test", "clip_id"].astype(str))
-        test_visible = len(test_ids & set(prediction_table.by_clip))
-        if train_visible and test_visible:
-            st.sidebar.caption(
-                f"Loaded {len(prediction_table.by_clip):,} predictions from {prediction_source}. "
-                f"Matched {train_visible:,} training and {test_visible:,} test clips in current view."
-            )
-        elif train_visible:
-            st.sidebar.caption(
-                f"Loaded {len(prediction_table.by_clip):,} predictions from {prediction_source}. "
-                f"Matched {train_visible:,} training clips."
-            )
-        else:
-            st.sidebar.caption(
-                f"Loaded {len(prediction_table.by_clip):,} predictions from {prediction_source}. "
-                f"Matched {test_visible:,}/{len(test_ids):,} visible test clips."
-            )
-        if prediction_table.blank_predictions:
-            st.sidebar.warning(
-                f"Ignored {prediction_table.blank_predictions:,} row(s) with blank predictions."
-            )
+    # Predictions are now loaded *inside* Clip explorer only, so Overview/Data quality
+    # stay prediction-free and do not change when switching prediction files.
     if partial_manifest and background_process is not None:
         render_background_manifest_status(
             background_process,
@@ -2310,7 +2180,7 @@ def main() -> None:
     if page == "Overview":
         render_overview(frame)
     elif page == "Clip explorer":
-        render_clip_explorer(frame, sources)
+        render_clip_explorer(frame, sources, prediction_candidates)
     else:
         render_quality(frame)
 

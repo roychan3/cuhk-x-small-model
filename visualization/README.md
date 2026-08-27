@@ -105,16 +105,21 @@ Train-only and combined output use `clip_id,prediction`, preserving identifiers
 such as `0_Wash_face/user1/1-1-1` when the CSV is reloaded.
 
 The dashboard also reads any `path,prediction` CSV produced by
-`python -m modeling.train` and `python -m modeling.predict`. It automatically
-selects the newest compatible CSV under `outputs/` when a session starts.
+`python -m modeling.train` and `python -m modeling.predict`. `Clip explorer`
+has a **Prediction file** dropdown listing the compatible CSVs under
+`outputs/`, newest first, plus a *(No predictions)* entry. It starts on the
+file most recently produced on **Workflow** and follows every later hand-off
+from that page, while a manual choice made here sticks until the hand-off
+changes again.
 
-For test data, `Clip explorer` adds a predicted-action filter, includes the
-action ID/name beside every clip ID, and keeps the selected prediction visible
-above synchronized playback. `Overview` adds prediction coverage, a class
-distribution chart, and a table of every indexed test clip and its prediction.
-Blank prediction rows are ignored and reported; duplicate clips, non-integer
-IDs, unknown action IDs, and malformed headers are rejected with a sidebar
-error instead of being silently displayed.
+Predictions are attached to a copy of the clip index owned by this page, so
+`Overview` and `Data quality` report the dataset itself and do not change when
+the prediction file does. For test data, `Clip explorer` adds a
+predicted-action filter, includes the action ID/name beside every clip ID, and
+keeps the selected prediction visible above synchronized playback. Blank
+prediction rows are ignored and reported; duplicate clips, non-integer IDs,
+unknown action IDs, and malformed headers are rejected with an error on the
+page instead of being silently displayed.
 
 Programmatic use (no UI) is also supported:
 

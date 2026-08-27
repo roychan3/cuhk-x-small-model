@@ -132,9 +132,9 @@ This repository includes a Streamlit dashboard with:
 - one **Workflow** page for choosing the sample or full dataset, extracting a
   named feature cache, training to explicit model/submission paths, and running
   prediction to a named CSV;
-- automatic handoff of the selected dataset and prediction CSV to **Overview**
-  and **Clip explorer**, where predictions are shown with the synchronized
-  sensor streams;
+- automatic handoff of the selected dataset to every page, and of the
+  prediction CSV to **Clip explorer**, where a **Prediction file** dropdown
+  shows them with the synchronized sensor streams;
 - missing-modality, empty-sensor, and timestamp-alignment diagnostics;
 - **Algorithm comparison** page comparing every `artifacts/*/validation.json` (leaderboard, bar chart, confusion matrix + Δ recall, folds, metadata) — same source as `python -m modeling.compare`, and its CSV download is byte-identical to that command's output.
 
@@ -310,12 +310,12 @@ There are seven suites with different requirements:
 | `tests/test_predictions.py` | 9 | standard library only | always runs |
 | `tests/test_training_pipeline.py` | 29 | standard library only | always runs |
 | `tests/test_comparison_format.py` | 13 | standard library only | always runs; its 2 CLI-parity tests skip without `modeling/requirements.txt` |
-| `tests/test_model_predictions.py` | 32 | artifact discovery and CSV round-tripping need the standard library only; the rest need `numpy`, `visualization/requirements.txt` (for `visualization.app`), or `modeling/requirements.txt` | 5 tests always run; the other 27 skip. Dataset I/O is mocked throughout, so no suite needs the dataset |
+| `tests/test_model_predictions.py` | 39 | artifact discovery and CSV round-tripping need the standard library only; the rest need `numpy`, `visualization/requirements.txt` (for `visualization.app`), or `modeling/requirements.txt` | 5 tests always run; the other 34 skip. Dataset I/O is mocked throughout, so no suite needs the dataset |
 | `tests/test_algorithm_comparison.py` | 19 | `visualization/requirements.txt` + `numpy` (for confusion-matrix math) | collapses to 1 skip |
 | `tests/test_modeling.py` | 27 | `modeling/requirements.txt` | collapses to 1 skip |
 
-So a bare interpreter reports `Ran 101 tests ... OK (skipped=30)`, while an
-interpreter with `visualization` + `modeling` deps reports `Ran 145 tests ... OK`
+So a bare interpreter reports `Ran 108 tests ... OK (skipped=37)`, while an
+interpreter with `visualization` + `modeling` deps reports `Ran 152 tests ... OK`
 (`skipped=1` when the optional real validation artifact is absent). A skip is
 expected, not a failure. Install the extras to run
 everything:

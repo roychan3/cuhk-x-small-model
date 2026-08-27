@@ -58,6 +58,7 @@ try:
         _timeline_selections,
         add_predictions,
         correctness_flag,
+        prediction_file_options,
         skeleton_calibration,
     )
 
@@ -839,3 +840,80 @@ class CorrectnessFlagTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@needs_app
+class PredictionPickerOptionTests(unittest.TestCase):
+    """The Workflow hand-off has regressed three times in this picker."""
+
+    def test_candidates_are_listed_newest_first_after_the_none_entry(self) -> None:
+        options, _default = prediction_file_options(
+            [Path("/repo/outputs/new.csv"), Path("/repo/outputs/old.csv")],
+            "",
+            Path("/repo"),
+        )
+        self.assertEqual(
+            options, ["", "/repo/outputs/new.csv", "/repo/outputs/old.csv"]
+        )
+
+    def test_an_empty_handoff_selects_none_rather_than_the_newest_file(self) -> None:
+        """Switching dataset clears the hand-off on purpose.
+
+        Falling back to the newest discovered CSV there would resurrect
+        predictions computed against the dataset the user just left.
+        """
+
+        _options, default = prediction_file_options(
+            [Path("/repo/outputs/new.csv")], "", Path("/repo")
+        )
+        self.assertEqual(default, "")
+
+    def test_a_handoff_wins_over_the_newest_candidate(self) -> None:
+        root = Path("/repo")
+        _options, default = prediction_file_options(
+            [Path("/repo/outputs/new.csv"), Path("/repo/outputs/old.csv")],
+            "/repo/outputs/old.csv",
+            root,
+        )
+        self.assertEqual(default, "/repo/outputs/old.csv")
+
+    def test_a_relative_handoff_is_resolved_against_the_repository(self) -> None:
+        # Two candidates, and the hand-off names the *second*. Without
+        # resolution it matches nothing and the newest file wins instead, so
+        # this only passes when the relative path is joined to the root.
+        _options, default = prediction_file_options(
+            [Path("/repo/outputs/new.csv"), Path("/repo/outputs/old.csv")],
+            "outputs/old.csv",
+            Path("/repo"),
+        )
+        self.assertEqual(default, "/repo/outputs/old.csv")
+
+    def test_a_handoff_outside_outputs_is_offered_when_it_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            elsewhere = root / "artifacts" / "run" / "preds.csv"
+            elsewhere.parent.mkdir(parents=True)
+            elsewhere.write_text("clip_id,prediction\n", encoding="utf-8")
+
+            options, default = prediction_file_options(
+                [root / "outputs" / "a.csv"], str(elsewhere), root
+            )
+
+        # Discovery only scans outputs/, but Workflow may write anywhere.
+        self.assertIn(str(elsewhere), options)
+        self.assertEqual(default, str(elsewhere))
+
+    def test_a_handoff_that_does_not_exist_falls_back_to_discovery(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            options, default = prediction_file_options(
+                [root / "outputs" / "a.csv"], str(root / "gone.csv"), root
+            )
+
+        self.assertNotIn(str(root / "gone.csv"), options)
+        self.assertEqual(default, str(root / "outputs" / "a.csv"))
+
+    def test_no_candidates_leaves_only_the_disabled_option(self) -> None:
+        options, default = prediction_file_options([], "", Path("/repo"))
+        self.assertEqual(options, [""])
+        self.assertEqual(default, "")
