@@ -16,6 +16,31 @@ from typing import Any, IO, Mapping
 
 from visualization.progress import COMPLETE, ERROR, RUNNING
 
+from visualization.feature_blocks import (
+    ALL_FEATURE_BLOCKS,
+    DEFAULT_FEATURE_BLOCKS,
+    FEATURE_BLOCK_GROUPS,
+    FEATURE_BLOCK_LABELS,
+    normalize_feature_blocks,
+)
+
+_BLOCK_LABELS = FEATURE_BLOCK_LABELS
+
+# Descriptions only. Widths are deliberately absent: they are computed from
+# FeatureConfig (image size, temporal bins, skeleton frames, HOG parameters)
+# and have already changed twice. Each run records its own under
+# `raw_feature_dimensions` in validation.json, which Algorithm comparison shows.
+_BLOCK_HELP = {
+    "depth": "Depth_Color frames reduced to HOG and coarse grid summaries.",
+    "depth_engineered": "Temporal Depth_Color pyramid plus HSV colour cues.",
+    "ir": "IR frames through the same pipeline as Depth (legacy; usually off).",
+    "ir_engineered": "Temporal IR pyramid over appearance and motion.",
+    "imu": "Per-device accelerometer, gyroscope and orientation statistics.",
+    "imu_engineered": "Spectral, quaternion and cross-device agreement features.",
+    "skeleton": "Pelvis-centred poses with velocities and confidences.",
+    "skeleton_engineered": "Joint angles, distances and speed/acceleration summaries.",
+}
+
 
 RUN_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 PIPELINE_STAGES = (
@@ -51,6 +76,7 @@ class TrainingPipelineConfig:
     extract_only: bool = False
     skip_validation: bool = False
     model_output_path: Path | None = None
+    feature_blocks: tuple[str, ...] | None = None
 
 
 @dataclass
@@ -103,6 +129,58 @@ def workflow_dataset_paths(
         str(state.get("workflow_test_csv") or default_test_csv)
     ).expanduser()
     return dataset_root.resolve(), test_csv.resolve(), sample
+
+
+
+
+def _feature_cache_blocks(path: Path) -> tuple[str, ...]:
+    """Blocks held by a cache file, or empty when it cannot be read.
+
+    Imported lazily so this page still loads without the modeling stack, which
+    the standard-library-only tests rely on.
+    """
+
+    if not path.is_file():
+        return ()
+    try:
+        from modeling.cache import cached_feature_blocks
+    except ImportError:
+        return ()
+    return cached_feature_blocks(path)
+
+
+def _sync_feature_block_state() -> None:
+    """Repair the block selection when it is missing, legacy, or invalid.
+
+    The selection lives in two places: a canonical list and one
+    ``workflow_block_<name>`` key per checkbox. Repairing only the list would be
+    undone immediately, because the checkbox sync rebuilds the list from those
+    keys. So a repair writes both — but only when one is actually needed, since
+    writing the checkbox keys on every render would discard the user's clicks.
+    """
+
+    import streamlit as st
+
+    raw = st.session_state.get("workflow_feature_blocks")
+    if isinstance(raw, str):
+        candidate: list[str] | None = [part.strip() for part in raw.split(",") if part.strip()]
+    elif isinstance(raw, (list, tuple)):
+        candidate = [str(item) for item in raw]
+    else:
+        candidate = None
+    try:
+        blocks = list(normalize_feature_blocks(candidate))
+    except ValueError:
+        blocks = list(DEFAULT_FEATURE_BLOCKS)
+
+    keys_present = all(
+        f"workflow_block_{block}" in st.session_state for block in ALL_FEATURE_BLOCKS
+    )
+    if raw == blocks and keys_present:
+        return
+    st.session_state["workflow_feature_blocks"] = blocks
+    for block in ALL_FEATURE_BLOCKS:
+        st.session_state[f"workflow_block_{block}"] = block in blocks
 
 
 def parse_json_object(value: str, label: str) -> dict[str, Any] | None:
@@ -242,6 +320,8 @@ def build_training_command(
         "--progress-file",
         str(progress_path),
     ]
+    if config.feature_blocks is not None:
+        command.extend(("--feature-blocks", ",".join(config.feature_blocks)))
     if config.search_space is not None and not config.skip_validation:
         command.extend(
             ("--search-space", json.dumps(config.search_space, sort_keys=True))
@@ -827,6 +907,8 @@ def render_training_pipeline(repository_root: Path, default_dataset_root: str) -
             if sample
             else "artifacts/features/four_sensor_v3.npz"
         )
+        # Keep the dropdown selector in sync — it has its own persisted key
+        st.session_state["workflow_feature_cache_select"] = st.session_state["workflow_feature_cache"]
         st.session_state["saved_manifest_input"] = ""
         st.session_state["use_manifest_checkbox"] = False
         st.session_state["prediction_csv_input"] = ""
@@ -851,6 +933,7 @@ def render_training_pipeline(repository_root: Path, default_dataset_root: str) -
         "workflow_parameters",
         "workflow_folds",
         "workflow_repeats",
+        "workflow_feature_blocks",
     }
     if not required_state <= set(st.session_state):
         sample = st.session_state["workflow_dataset_choice"] == SAMPLE_DATASET
@@ -866,11 +949,19 @@ def render_training_pipeline(repository_root: Path, default_dataset_root: str) -
                 else "artifacts/features/four_sensor_v3.npz"
             ),
         )
+        st.session_state.setdefault(
+            "workflow_feature_blocks", list(DEFAULT_FEATURE_BLOCKS)
+        )
         reset_algorithm_outputs()
         if existing_prediction_output:
             st.session_state["workflow_prediction_output"] = (
                 existing_prediction_output
             )
+    # The selection lives in two places: this canonical list and one
+    # `workflow_block_<name>` key per checkbox. Repairing only the list would be
+    # undone moments later, because the checkbox sync rebuilds the list from
+    # those keys — so any repair has to write both.
+    _sync_feature_block_state()
 
     st.subheader("1. Dataset")
     st.radio(
@@ -953,17 +1044,202 @@ def render_training_pipeline(repository_root: Path, default_dataset_root: str) -
         if not test_csv.is_file():
             raise ValueError(f"Test CSV does not exist: {test_csv}")
 
+    # ------------------------------------------------------------------
+    # Feature channel selection (shared by extraction + training)
+    # ------------------------------------------------------------------
     st.divider()
-    st.subheader("2. Feature extraction")
+    st.subheader("2. Feature channels")
     st.caption(
-        "Create one reusable feature file. Training reuses this path automatically."
+        "Choose which sensor streams and engineered views to extract and train on. "
+        "Each distinct combination writes to its own cache file and appears as a "
+        "separate row in Algorithm comparison — train the same algorithm with "
+        "different channel sets to see the ablation."
+    )
+
+    # Preset buttons — they write directly to session_state then rerun.
+    # The checkbox widgets keep their own persisted keys (workflow_block_*)
+    # so we must sync those keys as well — otherwise Streamlit ignores the
+    # `value=` passed to st.checkbox on the next render (widget state wins)
+    # and a preset appears to have no effect (e.g. IR(base) stays off after
+    # clicking "All 8").
+    def _apply_preset(blocks: list[str]) -> None:
+        st.session_state["workflow_feature_blocks"] = blocks
+        for _b in ALL_FEATURE_BLOCKS:
+            st.session_state[f"workflow_block_{_b}"] = _b in blocks
+
+    preset_cols = st.columns(5)
+    if preset_cols[0].button("Default (7)", help="Default 7-block set (legacy IR base off)"):
+        _apply_preset(list(DEFAULT_FEATURE_BLOCKS))
+        st.rerun()
+    if preset_cols[1].button("All 8", help="All base + engineered blocks"):
+        _apply_preset(list(ALL_FEATURE_BLOCKS))
+        st.rerun()
+    if preset_cols[2].button("Bases only", help="Only base blocks, no engineered"):
+        _apply_preset(["depth", "ir", "imu", "skeleton"])
+        st.rerun()
+    if preset_cols[3].button("Engineered only"):
+        _apply_preset(
+            [
+                "depth_engineered",
+                "ir_engineered",
+                "imu_engineered",
+                "skeleton_engineered",
+            ]
+        )
+        st.rerun()
+    if preset_cols[4].button("Depth+Skeleton"):
+        _apply_preset(
+            [
+                "depth",
+                "depth_engineered",
+                "skeleton",
+                "skeleton_engineered",
+            ]
+        )
+        st.rerun()
+
+    # Grouped channel checkboxes (stay outside any form so changes are immediate)
+    channel_cols = st.columns(4)
+    current_blocks = set(st.session_state.get("workflow_feature_blocks", []))
+    # We collect clicks and write back at the end of this block so the UI stays
+    # responsive — Streamlit reruns on every widget interaction.
+    new_blocks: set[str] = set()
+    for col_idx, (group_name, blocks) in enumerate(FEATURE_BLOCK_GROUPS.items()):
+        with channel_cols[col_idx]:
+            st.markdown(f"**{group_name}**")
+            for block in blocks:
+                checked = block in current_blocks
+                # Unique key per block so Streamlit can track it
+                toggled = st.checkbox(
+                    _BLOCK_LABELS[block],
+                    value=checked,
+                    key=f"workflow_block_{block}",
+                    help=_BLOCK_HELP[block],
+                )
+                if toggled:
+                    new_blocks.add(block)
+    # Sync checkbox state back to the canonical list (only when it actually changed)
+    if new_blocks != current_blocks:
+        # Keep order from ALL_FEATURE_BLOCKS for stable cache naming / display
+        ordered = [b for b in ALL_FEATURE_BLOCKS if b in new_blocks]
+        st.session_state["workflow_feature_blocks"] = ordered
+        # Don't rerun here — the checkbox interaction already triggered one,
+        # and writing the canonical list keeps the next render consistent.
+
+    selected_blocks_display: tuple[str, ...] = tuple(
+        st.session_state.get("workflow_feature_blocks", [])
+    )
+    try:
+        selected_blocks_display = normalize_feature_blocks(selected_blocks_display)
+    except ValueError as exc:
+        st.error(str(exc))
+        selected_blocks_display = tuple()
+
+    if not selected_blocks_display:
+        st.error("Select at least one feature block.")
+    else:
+        st.caption(
+            f"Selected **{len(selected_blocks_display)}** blocks: "
+            + ", ".join(f"`{b}`" for b in selected_blocks_display)
+            + f"  •  cache hint: `artifacts/features/{'_'.join(selected_blocks_display[:3])}… .npz`"
+        )
+        cache_path = Path(str(st.session_state.get("workflow_feature_cache", "")))
+        if not cache_path.is_absolute():
+            cache_path = repository_root / cache_path
+        cached = _feature_cache_blocks(cache_path)
+        if cached:
+            selected_set = set(selected_blocks_display)
+            if set(cached) == selected_set:
+                st.success(f"Cache `{cache_path.name}` holds exactly these blocks.")
+            elif selected_set <= set(cached):
+                st.info(
+                    f"Cache `{cache_path.name}` holds `{', '.join(cached)}`. Training "
+                    "will use the selected subset of it; no re-extraction needed."
+                )
+            else:
+                missing = [b for b in selected_blocks_display if b not in cached]
+                st.warning(
+                    f"Cache `{cache_path.name}` is missing `{', '.join(missing)}`. "
+                    "Training will extract the union and update the file."
+                )
+
+    # ------------------------------------------------------------------
+    # Feature cache file dropdown (replaces free-form text input)
+    # ------------------------------------------------------------------
+    st.markdown("**Feature cache file**")
+    st.caption(
+        "Select an existing cache or create a new one for the chosen channels. "
+        "Each channel set should use its own file so ablations stay distinct and appear separately in Algorithm comparison."
+    )
+
+    def _discover_feature_caches() -> list[Path]:
+        root = repository_root / "artifacts" / "features"
+        if not root.is_dir():
+            return []
+        return sorted(root.glob("*.npz"), key=lambda p: (p.stat().st_mtime_ns, p.name), reverse=True)
+
+    _discovered = _discover_feature_caches()
+    _discovered_rels = [str(p.relative_to(repository_root)) for p in _discovered]
+    _base_options = list(dict.fromkeys(_discovered_rels + ["artifacts/features/four_sensor_v3.npz", "artifacts/features/ui_sample.npz"]))
+    _current_cache = str(st.session_state.get("workflow_feature_cache", ""))
+    if _current_cache and _current_cache not in _base_options:
+        _base_options = [_current_cache] + _base_options
+    _sentinel = "— Create new file… —"
+    _options = _base_options + [_sentinel]
+    _labels: dict[str, str] = {}
+    for _opt in _base_options:
+        _p = repository_root / _opt
+        if _p.is_file():
+            blocks = _feature_cache_blocks(_p)
+            _labels[_opt] = f"{_opt}  —  {', '.join(blocks)}" if blocks else _opt
+        else:
+            _labels[_opt] = f"{_opt} (new)"
+    _labels[_sentinel] = _sentinel
+
+    # Ensure the selectbox state is initialized to the current cache
+    if "workflow_feature_cache_select" not in st.session_state:
+        st.session_state["workflow_feature_cache_select"] = _current_cache if _current_cache in _options else _options[0]
+
+    _selected_cache = st.selectbox(
+        "Feature cache file",
+        options=_options,
+        format_func=lambda x: _labels.get(x, x),
+        key="workflow_feature_cache_select",
+        help="Choose an existing .npz cache to reuse, or create a new one. The cache stores the exact channel combination; training will rebuild or filter if the file's blocks don't match the selection.",
+    )
+    if _selected_cache == _sentinel:
+        _custom_default = st.session_state.get("workflow_feature_cache_custom", "artifacts/features/custom.npz")
+        # Suggest a name based on selected channels
+        if _custom_default == "artifacts/features/custom.npz" and selected_blocks_display:
+            _suggested = f"artifacts/features/{'_'.join(selected_blocks_display[:3])}.npz"
+            if _suggested != _custom_default:
+                _custom_default = _suggested
+        _custom_path = st.text_input(
+            "New cache path",
+            value=_custom_default,
+            key="workflow_feature_cache_custom",
+            help="Must be a repository-local .npz file. Use a distinct name per channel set.",
+        )
+        _effective_cache = _custom_path.strip() if _custom_path.strip() else _current_cache
+    else:
+        _effective_cache = _selected_cache
+
+    if _effective_cache and _effective_cache != _current_cache:
+        st.session_state["workflow_feature_cache"] = _effective_cache
+        _current_cache = _effective_cache
+
+    st.caption(f"Selected cache: `{_current_cache}` — training and extraction will use this path.")
+    # Keep a convenience alias for the form handlers
+    feature_cache_text = _current_cache
+
+    st.divider()
+    st.subheader("3. Feature extraction")
+    st.caption(
+        "Create one reusable feature file for the **selected channels**. Training reuses this path automatically — "
+        "changing channels and re-extracting is how you build ablations."
     )
     with st.form("feature_extraction_form"):
-        feature_cache_text = st.text_input(
-            "Feature output file",
-            key="workflow_feature_cache",
-            help="Must be a repository-local .npz file.",
-        )
+        st.caption(f"Feature cache: `{feature_cache_text}` — change via the dropdown above.")
         feature_columns = st.columns(3)
         feature_jobs = feature_columns[0].number_input(
             "Parallel jobs",
@@ -980,6 +1256,15 @@ def render_training_pipeline(repository_root: Path, default_dataset_root: str) -
             "Allow replacement",
             help="Required when rebuilding an existing file.",
         )
+        # Show selected channels inside the form as read-only context
+        st.caption(
+            "Channels for this extraction: "
+            + (
+                ", ".join(f"`{b}`" for b in selected_blocks_display)
+                if selected_blocks_display
+                else "— none selected —"
+            )
+        )
         extract_submitted = st.form_submit_button(
             "Run feature extraction", type="primary", width="stretch"
         )
@@ -987,6 +1272,8 @@ def render_training_pipeline(repository_root: Path, default_dataset_root: str) -
     if extract_submitted:
         try:
             validate_dataset()
+            if not selected_blocks_display:
+                raise ValueError("Select at least one feature block before extracting.")
             feature_cache = repository_output_path(
                 repository_root, feature_cache_text, "Feature output"
             )
@@ -1013,6 +1300,7 @@ def render_training_pipeline(repository_root: Path, default_dataset_root: str) -
                 cv_repeats=1,
                 rebuild_features=bool(rebuild_features),
                 extract_only=True,
+                feature_blocks=tuple(selected_blocks_display),
             )
             st.session_state["training_pipeline_process"] = start_training_run(
                 repository_root, config
@@ -1022,10 +1310,11 @@ def render_training_pipeline(repository_root: Path, default_dataset_root: str) -
             st.error(str(exc))
 
     st.divider()
-    st.subheader("3. Training")
+    st.subheader("4. Training")
     st.caption(
-        f"Uses `{st.session_state['workflow_feature_cache']}`; if it is missing, "
-        "the trainer creates it first."
+        f"Uses `{st.session_state['workflow_feature_cache']}` with channels "
+        f"`{', '.join(selected_blocks_display)}` — if the cache is missing, "
+        "the trainer creates it first. Change channels in section 2 before training a new ablation."
     )
 
     def algorithm_changed() -> None:
@@ -1158,6 +1447,8 @@ def render_training_pipeline(repository_root: Path, default_dataset_root: str) -
                 if run_validation
                 else parse_json_object(parameters_text, "Final parameters")
             )
+            if not selected_blocks_display:
+                raise ValueError("Select at least one feature block before training.")
             config = TrainingPipelineConfig(
                 dataset_root=dataset_root,
                 test_csv=test_csv,
@@ -1175,6 +1466,7 @@ def render_training_pipeline(repository_root: Path, default_dataset_root: str) -
                 parameters=parameters,
                 skip_validation=not run_validation,
                 model_output_path=model_output,
+                feature_blocks=tuple(selected_blocks_display),
             )
             st.session_state["training_pipeline_process"] = start_training_run(
                 repository_root, config
@@ -1184,7 +1476,7 @@ def render_training_pipeline(repository_root: Path, default_dataset_root: str) -
             st.error(str(exc))
 
     st.divider()
-    st.subheader("4. Prediction")
+    st.subheader("5. Prediction")
     st.caption(
         "Run a saved model on training clips, test clips, or both. The saved CSV "
         "is used by Overview and Clip explorer."

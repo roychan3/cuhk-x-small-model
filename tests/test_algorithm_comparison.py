@@ -125,6 +125,7 @@ else:
                 "display_name": "A",
                 "artifact_name": "dir_a",
                 "parameters": "{}",
+                "feature_blocks": "depth, imu",
                 "accuracy": 0.5,
                 "macro_f1": 0.4,
                 "balanced_accuracy": 0.45,

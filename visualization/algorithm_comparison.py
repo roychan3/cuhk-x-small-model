@@ -26,6 +26,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from visualization.comparison_format import COMPARISON_FIELDS, assign_labels, comparison_row
+from visualization.feature_blocks import ALL_FEATURE_BLOCKS
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_ARTIFACTS_ROOT = REPOSITORY_ROOT / "artifacts"
@@ -47,6 +48,45 @@ def discover_validation_reports(artifacts_root: Path | str | None = None) -> lis
     return reports
 
 
+def _canonical_block_order(names: Any) -> str:
+    """Order block names the way reports record them."""
+
+    present = {str(name) for name in names}
+    ordered = [name for name in ALL_FEATURE_BLOCKS if name in present]
+    ordered += sorted(present - set(ALL_FEATURE_BLOCKS))
+    return ", ".join(ordered)
+
+
+def _feature_display(report: dict[str, Any]) -> str:
+    """Human-readable feature combination for a report."""
+
+    blocks = report.get("feature_blocks") or report.get("feature_blocks_display")
+    if isinstance(blocks, list):
+        return ", ".join(str(b) for b in blocks)
+    if isinstance(blocks, str):
+        return blocks
+    # Legacy fallback — infer from raw_feature_dimensions keys. Ordering has to
+    # match the recorded path, or one ablation appears as two filter entries.
+    dims = report.get("raw_feature_dimensions")
+    if isinstance(dims, dict) and dims:
+        return _canonical_block_order(dims.keys())
+    return "—"
+
+
+def _feature_blocks_list(report: dict[str, Any]) -> list[str]:
+    blocks = report.get("feature_blocks")
+    if isinstance(blocks, list) and blocks:
+        return [str(b) for b in blocks]
+    display = report.get("feature_blocks_display")
+    if isinstance(display, str) and display.strip():
+        return [p.strip() for p in display.split(",") if p.strip()]
+    dims = report.get("raw_feature_dimensions")
+    if isinstance(dims, dict) and dims:
+        blocks_display = _canonical_block_order(dims.keys())
+        return [part.strip() for part in blocks_display.split(",") if part.strip()]
+    return []
+
+
 def _row(path: Path, report: dict[str, Any]) -> dict[str, object]:
     """The shared comparison columns plus the extras only the dashboard shows."""
 
@@ -56,6 +96,8 @@ def _row(path: Path, report: dict[str, Any]) -> dict[str, object]:
         "parameters_dict": report.get("selected_parameters", {}),
         "selection_metric": report.get("selection_metric"),
         "test_clips": report.get("test_clips"),
+        "feature_blocks": _feature_display(report),
+        "feature_blocks_list": _feature_blocks_list(report),
         # `--skip-validation` runs have no `aggregate_metrics`, so the three
         # metric columns are already None; flag them so they can be filtered.
         "validation_skipped": bool(report.get("validation_skipped")),
@@ -70,7 +112,7 @@ def display_columns(sort_metric: str) -> list[str]:
     ``DataFrame[cols]`` raises ``ValueError: Duplicate column names found``.
     """
 
-    columns = ["label", "algorithm", "display_name", "artifact_name", "parameters", sort_metric]
+    columns = ["label", "algorithm", "display_name", "artifact_name", "parameters", "feature_blocks", sort_metric]
     columns += [field for field in COMPARISON_FIELDS if field not in columns]
     return columns
 
@@ -340,6 +382,9 @@ def render_algorithm_comparison() -> None:
     # Stable default sort
     default_metric = "macro_f1"
 
+    # Collect distinct feature combinations for the ablation filter
+    all_feature_combos = sorted({str(r.get("feature_blocks") or "—") for r in rows})
+
     ctrl_left, ctrl_mid, ctrl_right = st.columns((1.1, 1, 1))
     with ctrl_left:
         sort_metric = st.selectbox("Sort by", METRIC_CHOICES, index=METRIC_CHOICES.index(default_metric))
@@ -348,11 +393,30 @@ def render_algorithm_comparison() -> None:
     with ctrl_right:
         include_skipped = st.checkbox("Include skipped-validation runs", value=False)
 
+    # Second row of controls — feature channel filter
+    fcol1, fcol2 = st.columns((1.5, 1))
+    with fcol1:
+        selected_features = st.multiselect(
+            "Feature blocks (channel combinations)",
+            all_feature_combos,
+            default=all_feature_combos,
+            help="Filter runs by their exact feature combination. Leave all selected to compare every ablation side-by-side.",
+        )
+    with fcol2:
+        group_by_features = st.checkbox(
+            "Group leaderboard by feature set",
+            value=False,
+            help="When enabled, the bar chart and table are grouped so you can see the impact of each channel.",
+        )
+
     if not include_skipped:
         rows = [r for r in rows if not r.get("validation_skipped")]
 
     if selected_algos:
         rows = [r for r in rows if r["algorithm"] in selected_algos]
+
+    if selected_features:
+        rows = [r for r in rows if str(r.get("feature_blocks") or "—") in selected_features]
 
     if not rows:
         st.warning("No reports match the current filters.")
@@ -387,6 +451,7 @@ def render_algorithm_comparison() -> None:
             "display_name": st.column_config.TextColumn("Display name"),
             "artifact_name": st.column_config.TextColumn("Artifact dir"),
             "parameters": st.column_config.TextColumn("Parameters", width="medium"),
+            "feature_blocks": st.column_config.TextColumn("Feature blocks", width="large"),
             "accuracy": st.column_config.NumberColumn("Accuracy", format="%.4f"),
             "macro_f1": st.column_config.NumberColumn("Macro F1", format="%.4f"),
             "balanced_accuracy": st.column_config.NumberColumn("Bal. acc.", format="%.4f"),
@@ -396,6 +461,118 @@ def render_algorithm_comparison() -> None:
     )
     if best_value is not None and best_value >= 0:
         st.caption(f"Best by **{sort_metric}**: `{rows[0]['label']}` ({best_value:.4f}). Sorted descending; `None` (skipped validation) last.")
+
+    # --- Feature ablation summary ---
+    if len(all_feature_combos) > 1 or len(rows) > 1:
+        st.subheader("Feature ablation")
+        # Build a compact pivot: best macro_f1 per feature combination
+        ablation_rows: list[dict[str, object]] = []
+        # Compute best per combo from the *filtered* rows so the summary respects filters
+        # but also show how many runs use each combo.
+        from collections import defaultdict
+
+        best_per_combo: dict[str, dict[str, object]] = {}
+        counts: dict[str, int] = defaultdict(int)
+        for r in rows:
+            combo = str(r.get("feature_blocks") or "—")
+            counts[combo] += 1
+            cur = best_per_combo.get(combo)
+            cur_val = float(cur.get("macro_f1")) if cur and isinstance(cur.get("macro_f1"), (int, float)) else -1
+            new_val = float(r.get("macro_f1")) if isinstance(r.get("macro_f1"), (int, float)) else -1
+            if cur is None or new_val > cur_val:
+                best_per_combo[combo] = r
+
+        for combo, count in sorted(counts.items()):
+            best_row = best_per_combo.get(combo, {})
+            ablation_rows.append(
+                {
+                    "feature_blocks": combo,
+                    "runs": count,
+                    "best_run": best_row.get("label"),
+                    "accuracy": best_row.get("accuracy"),
+                    "macro_f1": best_row.get("macro_f1"),
+                    "balanced_accuracy": best_row.get("balanced_accuracy"),
+                }
+            )
+        ablation_df = pd.DataFrame(ablation_rows)
+        if not ablation_df.empty:
+            # Bar chart of macro_f1 by feature set
+            ab_plot = ablation_df.dropna(subset=["macro_f1"]).sort_values("macro_f1", ascending=False)
+            if not ab_plot.empty:
+                fig_ab = px.bar(
+                    ab_plot,
+                    x="feature_blocks",
+                    y="macro_f1",
+                    color="feature_blocks",
+                    text="macro_f1",
+                    hover_data=["best_run", "accuracy", "balanced_accuracy", "runs"],
+                )
+                fig_ab.update_traces(texttemplate="%{text:.4f}", textposition="outside")
+                fig_ab.update_layout(height=380, showlegend=False, xaxis_title="Feature blocks", yaxis_title="Best macro F1")
+                fig_ab.update_xaxes(tickangle=-30)
+                st.plotly_chart(fig_ab, width="stretch")
+            st.dataframe(
+                ablation_df,
+                hide_index=True,
+                width="stretch",
+                column_config={
+                    "feature_blocks": st.column_config.TextColumn("Feature blocks", width="large"),
+                    "runs": st.column_config.NumberColumn("Runs"),
+                    "best_run": st.column_config.TextColumn("Best run"),
+                    "accuracy": st.column_config.NumberColumn("Accuracy", format="%.4f"),
+                    "macro_f1": st.column_config.NumberColumn("Macro F1", format="%.4f"),
+                    "balanced_accuracy": st.column_config.NumberColumn("Bal. acc.", format="%.4f"),
+                },
+            )
+            st.caption("Grouped by exact feature-block string. Use distinct cache names per combination so each appears here.")
+        # Heatmap of feature presence vs macro_f1 when a single algorithm has multiple combos
+        if len(rows) >= 3 and len(all_feature_combos) >= 2:
+            # Try to show which blocks drive performance for the most common algorithm
+            most_common_algo = max(set(str(r["algorithm"]) for r in rows), key=lambda a: sum(1 for r in rows if r["algorithm"] == a))
+            subset = [r for r in rows if r["algorithm"] == most_common_algo]
+            if len(subset) >= 2 and len({str(r.get("feature_blocks")) for r in subset}) >= 2:
+                st.markdown(f"**Per-block impact for `{most_common_algo}`** (inclusion → mean macro F1)")
+                st.caption(
+                    "Observational, not an ablation: these runs differ in "
+                    "parameters and seeds as well as blocks, and each bar may "
+                    "rest on very few runs. Check the counts below before "
+                    "reading a difference as an effect."
+                )
+                block_stats: list[dict[str, object]] = []
+                import numpy as _np
+
+                for block in ["depth", "depth_engineered", "ir", "ir_engineered", "imu", "imu_engineered", "skeleton", "skeleton_engineered"]:
+                    with_vals = [float(r["macro_f1"]) for r in subset if isinstance(r.get("macro_f1"), (int, float)) and block in (r.get("feature_blocks_list") or [])]
+                    without_vals = [float(r["macro_f1"]) for r in subset if isinstance(r.get("macro_f1"), (int, float)) and block not in (r.get("feature_blocks_list") or [])]
+                    if with_vals and without_vals:
+                        block_stats.append(
+                            {
+                                "block": block,
+                                "with": float(_np.mean(with_vals)),
+                                "without": float(_np.mean(without_vals)),
+                                "delta": float(_np.mean(with_vals) - _np.mean(without_vals)),
+                                "n_with": len(with_vals),
+                                "n_without": len(without_vals),
+                            }
+                        )
+                if block_stats:
+                    stats_df = pd.DataFrame(block_stats).sort_values("delta", ascending=False)
+                    fig_delta = px.bar(
+                        stats_df,
+                        x="block",
+                        y="delta",
+                        color="delta",
+                        color_continuous_scale="RdBu",
+                        text="delta",
+                        hover_data=["with", "without", "n_with", "n_without"],
+                    )
+                    fig_delta.update_traces(texttemplate="%{text:.3f}", textposition="outside")
+                    # Center at 0
+                    max_abs = max(abs(float(v)) for v in stats_df["delta"]) if not stats_df.empty else 0.05
+                    fig_delta.update_layout(height=360, yaxis_title="Δ macro F1 (with − without)", xaxis_title=None, coloraxis_showscale=False)
+                    fig_delta.update_yaxes(range=[-max_abs * 1.15, max_abs * 1.15])
+                    st.plotly_chart(fig_delta, width="stretch")
+                    st.dataframe(stats_df, hide_index=True, width="stretch")
 
     # Version-mismatch warnings
     for label, rep in ordered:
@@ -415,14 +592,26 @@ def render_algorithm_comparison() -> None:
 
     # --- Metrics bar chart ---
     st.subheader("Metrics overview")
+    if group_by_features and len(all_feature_combos) > 1:
+        st.caption("Grouped by feature combination — each bar is a run, colored by its feature set.")
     metric_view = st.radio("Metric view", ("Selected metric", "All three metrics"), horizontal=True)
     if metric_view == "Selected metric":
-        plot_df = pd.DataFrame([{"run": r["label"], sort_metric: r.get(sort_metric)} for r in rows])
+        plot_df = pd.DataFrame(
+            [
+                {
+                    "run": r["label"],
+                    sort_metric: r.get(sort_metric),
+                    "feature_blocks": str(r.get("feature_blocks") or "—"),
+                }
+                for r in rows
+            ]
+        )
         plot_df = plot_df.dropna(subset=[sort_metric])
         if not plot_df.empty:
-            fig = px.bar(plot_df, x="run", y=sort_metric, text=sort_metric, color="run")
+            color_arg = "feature_blocks" if group_by_features else "run"
+            fig = px.bar(plot_df, x="run", y=sort_metric, text=sort_metric, color=color_arg)
             fig.update_traces(texttemplate="%{text:.4f}", textposition="outside")
-            fig.update_layout(height=420, showlegend=False, yaxis_title=sort_metric, xaxis_title=None)
+            fig.update_layout(height=420, showlegend=True, yaxis_title=sort_metric, xaxis_title=None)
             st.plotly_chart(fig, width="stretch")
         else:
             st.info(f"No `{sort_metric}` values to plot (all skipped validation).")
@@ -432,10 +621,28 @@ def render_algorithm_comparison() -> None:
             for m in METRIC_CHOICES:
                 v = r.get(m)
                 if isinstance(v, (int, float)):
-                    long_rows.append({"run": r["label"], "metric": m, "value": float(v)})
+                    long_rows.append(
+                        {
+                            "run": r["label"],
+                            "metric": m,
+                            "value": float(v),
+                            "feature_blocks": str(r.get("feature_blocks") or "—"),
+                        }
+                    )
         if long_rows:
             long_df = pd.DataFrame(long_rows)
-            fig = px.bar(long_df, x="run", y="value", color="metric", barmode="group", text="value")
+            if group_by_features:
+                fig = px.bar(
+                    long_df,
+                    x="run",
+                    y="value",
+                    color="feature_blocks",
+                    pattern_shape="metric",
+                    barmode="group",
+                    text="value",
+                )
+            else:
+                fig = px.bar(long_df, x="run", y="value", color="metric", barmode="group", text="value")
             fig.update_traces(texttemplate="%{text:.3f}", textposition="outside")
             fig.update_layout(height=440, yaxis_title="score", xaxis_title=None, legend_title=None)
             st.plotly_chart(fig, width="stretch")
@@ -611,6 +818,23 @@ def render_algorithm_comparison() -> None:
             else:
                 st.warning("No `library_versions` recorded in this artifact.")
         with m2:
+            st.markdown("**Feature combination**")
+            st.json(
+                {
+                    "feature_blocks": rep_meta.get("feature_blocks") or rep_meta.get("feature_blocks_display"),
+                    "raw_feature_dimensions": rep_meta.get("raw_feature_dimensions"),
+                    "total_dims": sum(int(v) for v in (rep_meta.get("raw_feature_dimensions") or {}).values()) if isinstance(rep_meta.get("raw_feature_dimensions"), dict) else None,
+                }
+            )
+            # Show a small block-presence matrix for this run vs all runs
+            try:
+                all_blocks = ["depth", "depth_engineered", "ir", "ir_engineered", "imu", "imu_engineered", "skeleton", "skeleton_engineered"]
+                present = set(_feature_blocks_list(rep_meta))
+                cols = st.columns(len(all_blocks))
+                for c, b in zip(cols, all_blocks):
+                    c.caption(f"{'✅' if b in present else '—'}\n{b}")
+            except Exception:
+                pass
             st.markdown("**Dataset & filtering**")
             st.json(
                 {

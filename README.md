@@ -260,7 +260,7 @@ repeat-to-repeat spread rather than a real difference.
 
 ## Modeling baselines
 
-The `modeling/` module provides an extensible four-modality training framework
+The `modeling/` module provides an extensible multimodal training framework
 using Depth Color, IR, IMU, and Skeleton features. It strictly filters
 incomplete training clips, validates by held-out participant groups, shares a
 feature cache across registered algorithms, and writes submissions in test CSV
@@ -312,10 +312,10 @@ There are seven suites with different requirements:
 | `tests/test_comparison_format.py` | 13 | standard library only | always runs; its 2 CLI-parity tests skip without `modeling/requirements.txt` |
 | `tests/test_model_predictions.py` | 39 | artifact discovery and CSV round-tripping need the standard library only; the rest need `numpy`, `visualization/requirements.txt` (for `visualization.app`), or `modeling/requirements.txt` | 5 tests always run; the other 34 skip. Dataset I/O is mocked throughout, so no suite needs the dataset |
 | `tests/test_algorithm_comparison.py` | 19 | `visualization/requirements.txt` + `numpy` (for confusion-matrix math) | collapses to 1 skip |
-| `tests/test_modeling.py` | 27 | `modeling/requirements.txt` | collapses to 1 skip |
+| `tests/test_modeling.py` | 32 | `modeling/requirements.txt` | collapses to 1 skip |
 
 So a bare interpreter reports `Ran 108 tests ... OK (skipped=37)`, while an
-interpreter with `visualization` + `modeling` deps reports `Ran 152 tests ... OK`
+interpreter with `visualization` + `modeling` deps reports `Ran 157 tests ... OK`
 (`skipped=1` when the optional real validation artifact is absent). A skip is
 expected, not a failure. Install the extras to run
 everything:
