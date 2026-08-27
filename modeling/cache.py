@@ -7,12 +7,40 @@ from pathlib import Path
 
 import numpy as np
 
-from modeling.features import FeatureConfig, RawFeatureBundle, feature_config_dict
+from visualization.feature_blocks import normalize_feature_blocks
+from modeling.features import (
+    ALL_FEATURE_BLOCKS,
+    FeatureConfig,
+    RawFeatureBundle,
+    feature_config_dict,
+)
 
 
 # 4: skeleton features were reindexed from COCO to the Human3.6M joint order
 # the dataset actually uses, so every cached skeleton block from 3 is stale.
 CACHE_VERSION = 4
+
+
+
+def cached_feature_blocks(path: str | Path) -> tuple[str, ...]:
+    """Return the blocks a cache holds, or empty when it cannot be read.
+
+    Callers use this to decide whether a cache can serve a run without paying
+    to load its matrices, so an unreadable or foreign file is reported as
+    "nothing" rather than raising.
+    """
+
+    try:
+        with np.load(Path(path).expanduser(), allow_pickle=False) as data:
+            blocks = json.loads(str(data["feature_blocks"]))
+    except (KeyError, OSError, ValueError):
+        return ()
+    if not isinstance(blocks, list):
+        return ()
+    try:
+        return normalize_feature_blocks([str(name) for name in blocks])
+    except ValueError:
+        return ()
 
 
 def save_feature_cache(
@@ -66,18 +94,16 @@ def load_feature_cache(
             isinstance(name, str) for name in feature_blocks
         ):
             raise ValueError("Feature cache has an invalid block list")
-        required = {"depth", "imu", "skeleton"}
-        supported = required | {
-            "ir",
-            "depth_engineered",
-            "ir_engineered",
-            "imu_engineered",
-            "skeleton_engineered",
-        }
-        if not required.issubset(feature_blocks):
-            raise ValueError("Feature cache is missing a required base block")
+        supported = set(ALL_FEATURE_BLOCKS)
+        if not feature_blocks:
+            raise ValueError("Feature cache is empty")
         if len(feature_blocks) != len(set(feature_blocks)) or not set(feature_blocks) <= supported:
             raise ValueError("Feature cache contains unsupported or duplicate blocks")
+        # Version 4 caches written before block selection always carried
+        # depth/imu/skeleton; newer ones may hold any non-empty subset. The
+        # payload layout is unchanged, so the version still describes the
+        # format and older files stay readable. Which blocks a cache actually
+        # holds is recorded in "feature_blocks" and checked by the caller.
         train_arrays = {name: data[f"train_{name}"].copy() for name in feature_blocks}
         test_arrays = {name: data[f"test_{name}"].copy() for name in feature_blocks}
         train = RawFeatureBundle(

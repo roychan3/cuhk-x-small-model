@@ -708,7 +708,7 @@ class ExtractFeatureBundleProgressTests(unittest.TestCase):
         from modeling.features import image_feature_size, imu_feature_size, skeleton_feature_size, image_engineered_feature_size, imu_engineered_feature_size, skeleton_engineered_feature_size
 
         def fake_extract(job):
-            _record, cfg = job
+            _record, cfg, _selected = job
             return (
                 np.zeros(image_feature_size(cfg), dtype=np.float32),
                 np.zeros(image_feature_size(cfg), dtype=np.float32) if False else None,  # ir not used in this config
@@ -720,8 +720,8 @@ class ExtractFeatureBundleProgressTests(unittest.TestCase):
                 np.zeros(skeleton_engineered_feature_size(cfg), dtype=np.float32),
             )
 
-        # Need to handle the actual signature: _extract_job takes (ClipRecord, FeatureConfig)
-        # Our fake should ignore and return the tuple above. Use more precise patch.
+        # _extract_job takes (record, config, selected_blocks); the fake returns
+        # one row per block in ALL_FEATURE_BLOCKS order.
         with patch("modeling.features._extract_job", side_effect=fake_extract):
             calls: list[tuple[int, int]] = []
 
@@ -771,7 +771,7 @@ class ExtractFeatureBundleProgressTests(unittest.TestCase):
                 )
 
     @staticmethod
-    def _dummy_job(job: object) -> tuple[object, ...]:
+    def _dummy_job(job: tuple[object, ...]) -> tuple[object, ...]:
         import numpy as np
         from modeling.features import (
             image_engineered_feature_size,
@@ -782,7 +782,7 @@ class ExtractFeatureBundleProgressTests(unittest.TestCase):
             skeleton_feature_size,
         )
 
-        _record, cfg = job
+        _record, cfg, _selected = job
         return (
             np.zeros(image_feature_size(cfg), dtype=np.float32),
             None,

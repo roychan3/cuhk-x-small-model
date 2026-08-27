@@ -16,6 +16,12 @@ import numpy as np
 from PIL import Image
 
 from modeling.data import ClipRecord, EXPECTED_IMU_DEVICES
+from visualization.feature_blocks import (
+    ALL_FEATURE_BLOCKS,
+    DEFAULT_FEATURE_BLOCKS,
+    FEATURE_BLOCK_GROUPS,
+    normalize_feature_blocks,
+)
 
 
 _TIMESTAMP_RE = re.compile(r"(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.\d{3})")
@@ -60,13 +66,40 @@ class FeatureConfig:
     skeleton_layout: str = "h36m"
 
 
+def filter_bundle_to_blocks(
+    bundle: RawFeatureBundle,
+    blocks: Sequence[str] | None,
+) -> RawFeatureBundle:
+    """Return a copy of ``bundle`` carrying only ``blocks``.
+
+    A selected block the bundle does not have is simply absent from the result;
+    callers that need every one present should compare against
+    ``modality_arrays()`` first.
+    """
+
+    if blocks is None:
+        return bundle
+    selected = set(normalize_feature_blocks(blocks))
+    arrays = bundle.modality_arrays()
+    return RawFeatureBundle(
+        clip_ids=bundle.clip_ids,
+        labels=bundle.labels,
+        groups=bundle.groups,
+        submission_paths=bundle.submission_paths,
+        **{
+            name: (arrays.get(name) if name in selected else None)
+            for name in ALL_FEATURE_BLOCKS
+        },
+    )
+
+
 @dataclass(frozen=True)
 class RawFeatureBundle:
     clip_ids: np.ndarray
-    depth: np.ndarray
-    ir: np.ndarray | None
-    imu: np.ndarray
-    skeleton: np.ndarray
+    depth: np.ndarray | None = None
+    ir: np.ndarray | None = None
+    imu: np.ndarray | None = None
+    skeleton: np.ndarray | None = None
     depth_engineered: np.ndarray | None = None
     ir_engineered: np.ndarray | None = None
     imu_engineered: np.ndarray | None = None
@@ -1027,43 +1060,67 @@ def extract_skeleton_features(directory: Path, config: FeatureConfig) -> np.ndar
 def extract_clip_features(
     record: ClipRecord,
     config: FeatureConfig,
+    selected_blocks: Sequence[str] | None = None,
 ) -> tuple[np.ndarray | None, ...]:
-    depth, depth_engineered = extract_image_feature_pair(
-        record.depth_dir,
-        config,
-        include_color=True,
-    )
-    assert depth is not None
-    infrared, ir_engineered = extract_image_feature_pair(
-        record.ir_dir,
-        config,
-        include_color=False,
-        include_base=config.include_legacy_ir,
-    )
-    imu, imu_engineered = extract_imu_feature_pair(record.imu_dir, config)
-    skeleton, skeleton_engineered = extract_skeleton_feature_pair(record.skeleton_dir, config)
-    return (
-        depth,
-        infrared,
-        imu,
-        skeleton,
-        depth_engineered,
-        ir_engineered,
-        imu_engineered,
-        skeleton_engineered,
-    )
+    """Extract one clip, returning ``None`` for every unselected block.
+
+    Blocks come in base/engineered pairs that share one read of the source
+    files, so a pair is extracted whenever either half is wanted and the unused
+    half is discarded.
+    """
+
+    needed = set(normalize_feature_blocks(selected_blocks))
+    values: dict[str, np.ndarray | None] = dict.fromkeys(ALL_FEATURE_BLOCKS)
+
+    def wanted(*names: str) -> bool:
+        return any(name in needed for name in names)
+
+    def keep(name: str, value: np.ndarray | None) -> None:
+        values[name] = value if name in needed else None
+
+    if wanted("depth", "depth_engineered"):
+        base, engineered = extract_image_feature_pair(
+            record.depth_dir, config, include_color=True
+        )
+        keep("depth", base)
+        keep("depth_engineered", engineered)
+    if wanted("ir", "ir_engineered"):
+        base, engineered = extract_image_feature_pair(
+            record.ir_dir,
+            config,
+            include_color=False,
+            # The legacy flag only decides whether the base is produced by
+            # default; asking for the block explicitly always produces it.
+            include_base=config.include_legacy_ir or "ir" in needed,
+        )
+        keep("ir", base)
+        keep("ir_engineered", engineered)
+    if wanted("imu", "imu_engineered"):
+        base, engineered = extract_imu_feature_pair(record.imu_dir, config)
+        keep("imu", base)
+        keep("imu_engineered", engineered)
+    if wanted("skeleton", "skeleton_engineered"):
+        base, engineered = extract_skeleton_feature_pair(record.skeleton_dir, config)
+        keep("skeleton", base)
+        keep("skeleton_engineered", engineered)
+
+    return tuple(values[name] for name in ALL_FEATURE_BLOCKS)
 
 
-def _extract_job(args: tuple[ClipRecord, FeatureConfig]) -> tuple[np.ndarray | None, ...]:
-    return extract_clip_features(*args)
+def _extract_job(
+    args: tuple[ClipRecord, FeatureConfig, tuple[str, ...]],
+) -> tuple[np.ndarray | None, ...]:
+    record, config, selected = args
+    return extract_clip_features(record, config, selected)
 
 
 def _progressive_results(
     records: Sequence[ClipRecord],
     config: FeatureConfig,
     n_jobs: int,
+    selected_blocks: tuple[str, ...],
 ) -> Iterator[tuple[np.ndarray | None, ...]]:
-    jobs = ((record, config) for record in records)
+    jobs = ((record, config, selected_blocks) for record in records)
     if n_jobs == 1:
         for job in jobs:
             yield _extract_job(job)
@@ -1080,8 +1137,14 @@ def extract_feature_bundle(
     n_jobs: int = 1,
     progress_every: int = 50,
     progress_callback: Callable[[int, int], None] | None = None,
+    selected_blocks: Sequence[str] | None = None,
 ) -> RawFeatureBundle:
     """Extract raw modality matrices while preserving record order.
+
+    ``selected_blocks`` optionally restricts extraction to a subset of
+    :data:`ALL_FEATURE_BLOCKS`.  When ``None`` the default set
+    :data:`DEFAULT_FEATURE_BLOCKS` is used for backward compatibility — the
+    legacy IR base block remains excluded unless explicitly requested.
 
     When ``progress_callback`` is provided it is called as
     ``progress_callback(done, total)`` each time ``progress_every`` clips
@@ -1093,36 +1156,24 @@ def extract_feature_bundle(
     if not records:
         raise ValueError("Cannot extract features from an empty record list")
     active_config = config or FeatureConfig()
-    depth: list[np.ndarray] = []
-    infrared: list[np.ndarray] = []
-    imu: list[np.ndarray] = []
-    skeleton: list[np.ndarray] = []
-    depth_engineered: list[np.ndarray] = []
-    ir_engineered: list[np.ndarray] = []
-    imu_engineered: list[np.ndarray] = []
-    skeleton_engineered: list[np.ndarray] = []
+    selected = normalize_feature_blocks(selected_blocks)
+    columns: dict[str, list[np.ndarray]] = {name: [] for name in selected}
+
     for index, values in enumerate(
-        _progressive_results(records, active_config, n_jobs), start=1
+        _progressive_results(records, active_config, n_jobs, selected), start=1
     ):
-        (
-            depth_value,
-            ir_value,
-            imu_value,
-            skeleton_value,
-            depth_engineered_value,
-            ir_engineered_value,
-            imu_engineered_value,
-            skeleton_engineered_value,
-        ) = values
-        depth.append(depth_value)
-        if ir_value is not None:
-            infrared.append(ir_value)
-        imu.append(imu_value)
-        skeleton.append(skeleton_value)
-        depth_engineered.append(depth_engineered_value)
-        ir_engineered.append(ir_engineered_value)
-        imu_engineered.append(imu_engineered_value)
-        skeleton_engineered.append(skeleton_engineered_value)
+        for name, value in zip(ALL_FEATURE_BLOCKS, values, strict=True):
+            if name not in columns:
+                continue
+            if value is None:
+                # Every selected block must yield a row for every clip. A gap
+                # would shorten one column and silently pair the remaining
+                # clips' features with the wrong labels.
+                raise ValueError(
+                    f"Block {name!r} produced no features for clip "
+                    f"{records[index - 1].clip_id!r}"
+                )
+            columns[name].append(value)
         if progress_every > 0 and (index % progress_every == 0 or index == len(records)):
             print(f"Extracted {index:,}/{len(records):,} clips", flush=True)
         if progress_callback is not None and (index % progress_every == 0 or index == len(records)):
@@ -1131,14 +1182,10 @@ def extract_feature_bundle(
     is_train = records[0].split == "train"
     return RawFeatureBundle(
         clip_ids=np.asarray([record.clip_id for record in records]),
-        depth=np.stack(depth),
-        ir=np.stack(infrared) if infrared else None,
-        imu=np.stack(imu),
-        skeleton=np.stack(skeleton),
-        depth_engineered=np.stack(depth_engineered),
-        ir_engineered=np.stack(ir_engineered),
-        imu_engineered=np.stack(imu_engineered),
-        skeleton_engineered=np.stack(skeleton_engineered),
+        **{
+            name: (np.stack(columns[name]) if name in columns else None)
+            for name in ALL_FEATURE_BLOCKS
+        },
         labels=(
             np.asarray([record.label for record in records], dtype=np.int64)
             if is_train

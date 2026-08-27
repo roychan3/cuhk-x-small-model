@@ -51,8 +51,17 @@ features they were never fitted on.
 The three active high-dimensional base blocks are independently mean-imputed,
 standardized, and reduced with PCA to 320 total components. The four compact
 engineered blocks are independently imputed and standardized, then passed
-through without sharing a PCA projection with the base features. With the
-default configuration, every registered algorithm receives 2,833 inputs.
+through without sharing a PCA projection with the base features. The input
+width therefore depends on both the feature configuration and the selected
+blocks; every run records its own under `raw_feature_dimensions` and
+`feature_blocks` in `validation.json`.
+
+Pass `--feature-blocks depth,imu_engineered` to extract and train on a subset —
+the block names are `depth`, `ir`, `imu`, `skeleton` and their `_engineered`
+counterparts, and the default is all of them except the legacy `ir` base. A
+cache holding more blocks than a run needs is reused and filtered rather than
+rebuilt, and a rebuild widens to the union with whatever the cache already had,
+so one cache path can serve a whole set of ablations.
 Models created before this change remain loadable: prediction automatically
 re-enables the legacy IR extractor when an older model requires that block.
 

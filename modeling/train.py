@@ -14,9 +14,17 @@ from typing import Any
 import numpy as np
 
 from modeling.algorithms import available_algorithms, get_algorithm
-from modeling.cache import load_feature_cache, save_feature_cache
+from modeling.cache import cached_feature_blocks, load_feature_cache, save_feature_cache
 from modeling.data import class_counts, discover_test_clips, discover_training_clips
-from modeling.features import FeatureConfig, RawFeatureBundle, extract_feature_bundle
+from modeling.features import (
+    ALL_FEATURE_BLOCKS,
+    DEFAULT_FEATURE_BLOCKS,
+    FeatureConfig,
+    RawFeatureBundle,
+    extract_feature_bundle,
+    filter_bundle_to_blocks,
+    normalize_feature_blocks,
+)
 from modeling.model import (
     cross_validate_detailed,
     fit_final_model,
@@ -79,6 +87,15 @@ def parse_args(default_algorithm: str = "logistic_regression") -> argparse.Names
     )
     parser.add_argument("--selection-metric", default="macro_f1")
     parser.add_argument("--random-state", type=int, default=42)
+    parser.add_argument(
+        "--feature-blocks",
+        default=None,
+        help=(
+            "Comma-separated feature blocks to extract and train on. "
+            f"Available: {', '.join(ALL_FEATURE_BLOCKS)}. "
+            f"Default: {', '.join(DEFAULT_FEATURE_BLOCKS)}."
+        ),
+    )
     parser.add_argument("--rebuild-features", action="store_true")
     parser.add_argument("--extract-only", action="store_true")
     parser.add_argument("--skip-validation", action="store_true")
@@ -120,15 +137,34 @@ def _search_space(value: str | None) -> Mapping[str, Sequence[Any]] | None:
     return parsed
 
 
+def _parse_feature_blocks(value: str | None) -> tuple[str, ...] | None:
+    if value is None or not str(value).strip():
+        return None
+    raw_blocks = [part.strip() for part in str(value).split(",") if part.strip()]
+    return normalize_feature_blocks(raw_blocks)
+
 def _cache_matches(
     train: RawFeatureBundle,
     test: RawFeatureBundle,
     training_ids: list[str],
     test_ids: list[str],
+    selected_blocks: tuple[str, ...] | None = None,
 ) -> bool:
-    return np.array_equal(train.clip_ids, np.asarray(training_ids)) and np.array_equal(
+    if not np.array_equal(train.clip_ids, np.asarray(training_ids)) or not np.array_equal(
         test.clip_ids, np.asarray(test_ids)
-    )
+    ):
+        return False
+    if selected_blocks is not None:
+        # A cache holding more blocks than requested is still usable: the extra
+        # ones are filtered out below. Re-extracting for every ablation would
+        # cost minutes to produce columns the cache already has. Only a
+        # genuinely missing block forces a rebuild.
+        required = set(selected_blocks)
+        if not required <= set(train.modality_arrays()):
+            return False
+        if not required <= set(test.modality_arrays()):
+            return False
+    return True
 
 
 def _write_submission(
@@ -195,6 +231,12 @@ def _run(args: argparse.Namespace, progress_path: Path | None) -> int:
         message="Discovering training and test clips",
     )
     config = FeatureConfig()
+    selected_blocks = _parse_feature_blocks(args.feature_blocks)
+    effective_blocks = normalize_feature_blocks(selected_blocks)
+    # What gets written to the cache. It may widen to the union with an
+    # existing cache so one path can serve several ablations.
+    extract_blocks = effective_blocks
+    print(f"Feature blocks: {', '.join(effective_blocks)}")
     artifacts_dir = (
         args.artifacts_dir.expanduser()
         if args.artifacts_dir is not None
@@ -252,8 +294,12 @@ def _run(args: argparse.Namespace, progress_path: Path | None) -> int:
                 test_bundle,
                 [record.clip_id for record in training_records],
                 [record.clip_id for record in test_records],
+                effective_blocks,
             ):
-                raise ValueError("Feature cache clip order does not match discovered clips")
+                raise ValueError(
+                    "Feature cache does not match the discovered clips or is "
+                    "missing a selected feature block"
+                )
             print(f"Loaded shared feature cache: {cache_path}")
             write_progress(
                 progress_path,
@@ -266,6 +312,19 @@ def _run(args: argparse.Namespace, progress_path: Path | None) -> int:
         except (KeyError, OSError, ValueError) as exc:
             print(f"Ignoring incompatible feature cache: {exc}")
             use_cache = False
+            # Re-extracting to add one block would otherwise drop the blocks the
+            # cache already held, so the next combination has to extract again.
+            # Widening the selection to their union keeps one cache path usable
+            # for every ablation.
+            cached_blocks = cached_feature_blocks(cache_path)
+            if cached_blocks and not set(cached_blocks) <= set(extract_blocks):
+                extract_blocks = normalize_feature_blocks(
+                    list(set(extract_blocks) | set(cached_blocks))
+                )
+                print(
+                    "Extracting the union with the existing cache: "
+                    f"{', '.join(extract_blocks)}"
+                )
 
     if not use_cache:
         print("Extracting training features...")
@@ -281,6 +340,7 @@ def _run(args: argparse.Namespace, progress_path: Path | None) -> int:
                 current=done,
                 total=total_feature_clips,
             ),
+            selected_blocks=extract_blocks,
         )
         print("Extracting test features...")
         test_bundle = extract_feature_bundle(
@@ -295,6 +355,7 @@ def _run(args: argparse.Namespace, progress_path: Path | None) -> int:
                 current=len(training_records) + done,
                 total=total_feature_clips,
             ),
+            selected_blocks=extract_blocks,
         )
         save_feature_cache(cache_path, train_bundle, test_bundle, config)
         print(f"Saved shared feature cache: {cache_path}")
@@ -306,6 +367,14 @@ def _run(args: argparse.Namespace, progress_path: Path | None) -> int:
             current=total_feature_clips,
             total=total_feature_clips,
         )
+
+    # The bundle can hold more than this run asked for: a reused cache may be a
+    # superset, and a rebuild widens to the union so one cache serves every
+    # ablation. Either way, train on exactly the requested blocks.
+    if set(effective_blocks) != set(train_bundle.modality_arrays()):
+        print(f"Training on {len(effective_blocks)} of the cache's feature blocks")
+        train_bundle = filter_bundle_to_blocks(train_bundle, effective_blocks)
+        test_bundle = filter_bundle_to_blocks(test_bundle, effective_blocks)
 
     test_feature_health = _feature_health(train_bundle, test_bundle)
     if args.extract_only:
@@ -380,6 +449,7 @@ def _run(args: argparse.Namespace, progress_path: Path | None) -> int:
             "training_clips": len(training_records),
             "test_clips": len(test_records),
             "class_counts": counts,
+            "feature_blocks": list(effective_blocks),
             "raw_feature_dimensions": {
                 name: int(values.shape[1])
                 for name, values in train_bundle.modality_arrays().items()

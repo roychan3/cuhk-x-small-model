@@ -14,7 +14,7 @@ try:
 
     from modeling.algorithms import available_algorithms, get_algorithm
     from modeling.cache import load_feature_cache, save_feature_cache
-    from modeling.data import EXPECTED_IMU_DEVICES, discover_training_clips
+    from modeling.data import ClipRecord, EXPECTED_IMU_DEVICES, discover_training_clips
     from modeling.model import (
         FittedMultimodalModel,
         _fit_reducers,
@@ -27,6 +27,8 @@ try:
         save_validation_outputs,
     )
     from modeling.features import (
+        ALL_FEATURE_BLOCKS,
+        DEFAULT_FEATURE_BLOCKS,
         HEAD,
         L_ANKLE,
         L_HIP,
@@ -47,11 +49,14 @@ try:
         extract_imu_feature_pair,
         extract_imu_features,
         extract_skeleton_feature_pair,
+        extract_feature_bundle,
         extract_skeleton_features,
+        filter_bundle_to_blocks,
         image_engineered_feature_size,
         image_feature_size,
         imu_engineered_feature_size,
         imu_feature_size,
+        normalize_feature_blocks,
         skeleton_engineered_feature_size,
         skeleton_feature_size,
     )
@@ -630,3 +635,78 @@ class ModelVersionMetadataTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FeatureBlockSelectionTests(unittest.TestCase):
+    def test_blocks_are_canonically_ordered_so_the_same_run_matches_itself(self) -> None:
+        first = normalize_feature_blocks(["skeleton", "depth"])
+        second = normalize_feature_blocks(["depth", "skeleton"])
+
+        # The tuple lands in validation.json and is compared against caches, so
+        # request order must not create two identities for one ablation.
+        self.assertEqual(first, second)
+        self.assertEqual(first, ("depth", "skeleton"))
+
+    def test_unknown_and_empty_selections_are_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Unknown feature block"):
+            normalize_feature_blocks(["depth", "lidar"])
+        with self.assertRaisesRegex(ValueError, "At least one"):
+            normalize_feature_blocks([])
+        self.assertEqual(normalize_feature_blocks(None), DEFAULT_FEATURE_BLOCKS)
+
+    def test_default_omits_only_the_legacy_ir_base(self) -> None:
+        self.assertEqual(
+            set(ALL_FEATURE_BLOCKS) - set(DEFAULT_FEATURE_BLOCKS), {"ir"}
+        )
+
+    def test_a_missing_row_is_rejected_instead_of_shortening_a_column(self) -> None:
+        """A gap would pair later clips' features with the wrong labels."""
+
+        records = [
+            ClipRecord(
+                split="train",
+                clip_id=f"0_Wash_face/user1/{index}",
+                depth_dir=Path("/tmp"),
+                ir_dir=Path("/tmp"),
+                imu_dir=Path("/tmp"),
+                skeleton_dir=Path("/tmp"),
+                label=0,
+                user="user1",
+            )
+            for index in range(3)
+        ]
+        config = FeatureConfig()
+        blocks = ("depth", "imu")
+
+        def job(args: tuple[object, ...]) -> tuple[object, ...]:
+            record, cfg, _selected = args
+            drop = record.clip_id.endswith("1")
+            values = {
+                "depth": None if drop else np.zeros(image_feature_size(cfg), dtype=np.float32),
+                "imu": np.zeros(imu_feature_size(cfg), dtype=np.float32),
+            }
+            return tuple(values.get(name) for name in ALL_FEATURE_BLOCKS)
+
+        with patch("modeling.features._extract_job", side_effect=job):
+            with self.assertRaisesRegex(ValueError, "produced no features for clip"):
+                extract_feature_bundle(
+                    records, config, n_jobs=1, selected_blocks=blocks
+                )
+
+    def test_filtering_keeps_only_the_requested_blocks(self) -> None:
+        rows = 4
+        bundle = RawFeatureBundle(
+            clip_ids=np.asarray([f"c{i}" for i in range(rows)]),
+            depth=np.zeros((rows, 3), dtype=np.float32),
+            imu=np.zeros((rows, 5), dtype=np.float32),
+            skeleton=np.zeros((rows, 7), dtype=np.float32),
+            labels=np.zeros(rows, dtype=np.int64),
+            groups=np.asarray(["u"] * rows),
+        )
+
+        filtered = filter_bundle_to_blocks(bundle, ["depth", "skeleton"])
+
+        self.assertEqual(set(filtered.modality_arrays()), {"depth", "skeleton"})
+        # Identity columns must survive the filter.
+        np.testing.assert_array_equal(filtered.clip_ids, bundle.clip_ids)
+        np.testing.assert_array_equal(filtered.labels, bundle.labels)
