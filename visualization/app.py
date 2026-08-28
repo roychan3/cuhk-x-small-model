@@ -45,6 +45,7 @@ from visualization.dataset import (
     resolve_dataset_root,
 )
 from visualization.manual_labels import (
+    active_row_indices,
     archive_manual_label_file,
     initial_label_clip,
     load_manual_label_rows,
@@ -73,6 +74,12 @@ from visualization.training_pipeline import (
 st.set_page_config(page_title="CUHK-X Dataset Explorer", page_icon="🧭", layout="wide")
 
 INITIAL_CLIP_LIMIT = 200
+
+#: Manual labels are recorded against the tracked test index rather than
+#: whichever CSV the workflow points at. The sample dataset ships a subset of
+#: these same clips, so both dataset choices label one canonical table that
+#: lives in the repository; two tables could disagree about the same clip.
+CANONICAL_TEST_CSV = REPOSITORY_ROOT / "Testing" / "test.csv"
 
 SKELETON_JOINT_NAMES = (
     "Pelvis",
@@ -1909,6 +1916,9 @@ def render_manual_labeling(
     if not test_csv.is_file():
         st.error(f"Test CSV does not exist: {test_csv}")
         return
+    if not CANONICAL_TEST_CSV.is_file():
+        st.error(f"The tracked test index is missing: {CANONICAL_TEST_CSV}")
+        return
 
     mapping_candidates = (
         dataset_root / "Training" / "class_mapping.csv",
@@ -1919,7 +1929,7 @@ def render_manual_labeling(
         st.error("Training/class_mapping.csv was not found in the dataset or repository.")
         return
 
-    output_path = manual_label_path(test_csv)
+    output_path = manual_label_path(CANONICAL_TEST_CSV)
     scope = str(output_path.resolve())
     selector_key = f"manual_label_clip::{scope}"
     pending_key = f"manual_label_pending_clip::{scope}"
@@ -1928,40 +1938,51 @@ def render_manual_labeling(
     try:
         action_mapping = load_action_mapping(mapping_path)
         fieldnames, rows = load_manual_label_rows(
-            test_csv,
+            CANONICAL_TEST_CSV,
             output_path,
             valid_action_ids=action_mapping,
         )
-        clip_ids = [clip_id_from_submission_path(row["path"]) for row in rows]
+        # The table always spans the tracked index; the active dataset decides
+        # which of its rows are reachable from this page.
+        indices = active_row_indices(rows, test_csv)
+        visible_rows = [rows[index] for index in indices]
+        clip_ids = [clip_id_from_submission_path(row["path"]) for row in visible_rows]
         if len(clip_ids) != len(set(clip_ids)):
             raise ValueError("The test CSV contains duplicate clip IDs")
     except Exception as exc:
         st.error(f"Could not load the labeling table: {exc}")
         _offer_label_table_reset(output_path, flash_key)
         return
-    if not rows:
+    if not visible_rows:
         st.info("The active test CSV contains no clips.")
         return
 
-    labeled_count = sum(bool(row["prediction"].strip()) for row in rows)
-    st.progress(labeled_count / len(rows))
+    labeled_count = sum(bool(row["prediction"].strip()) for row in visible_rows)
+    st.progress(labeled_count / len(visible_rows))
     st.caption(
-        f"{labeled_count:,} of {len(rows):,} clips labeled · source `{test_csv}` · "
-        f"output `{output_path}`"
+        f"{labeled_count:,} of {len(visible_rows):,} clips labeled · "
+        f"source `{test_csv}` · output `{output_path}`"
     )
+    if len(visible_rows) != len(rows):
+        recorded = sum(bool(row["prediction"].strip()) for row in rows)
+        st.caption(
+            f"This dataset reaches {len(visible_rows):,} of the {len(rows):,} "
+            f"clips in the tracked test index. Every dataset writes the same "
+            f"file, which holds {recorded:,} labels in total."
+        )
 
     pending_clip = st.session_state.pop(pending_key, None)
     if pending_clip in clip_ids:
         st.session_state[selector_key] = pending_clip
     if st.session_state.get(selector_key) not in clip_ids:
-        st.session_state[selector_key] = initial_label_clip(clip_ids, rows)
+        st.session_state[selector_key] = initial_label_clip(clip_ids, visible_rows)
 
     flash = st.session_state.pop(flash_key, None)
     if flash:
         level, message = flash
         getattr(st, level)(message)
 
-    row_by_clip = dict(zip(clip_ids, rows))
+    row_by_clip = dict(zip(clip_ids, visible_rows))
 
     def clip_label(clip_id: str) -> str:
         prediction = row_by_clip[clip_id]["prediction"].strip()
@@ -1977,7 +1998,10 @@ def render_manual_labeling(
         key=selector_key,
     )
     row_index = clip_ids.index(clip_id)
-    current_prediction = rows[row_index]["prediction"].strip()
+    # ``visible_rows`` holds the same dicts as ``rows``, so writing through
+    # either index updates the canonical table that gets saved.
+    table_index = indices[row_index]
+    current_prediction = visible_rows[row_index]["prediction"].strip()
     current_action = int(current_prediction) if current_prediction else None
     action_options: list[int | None] = [None, *sorted(action_mapping)]
     # The saved prediction belongs in the key, not just in ``index``: a value
@@ -2007,7 +2031,7 @@ def render_manual_labeling(
     def save_label(advance: bool) -> None:
         if selected_action is None:
             return
-        rows[row_index]["prediction"] = str(selected_action)
+        rows[table_index]["prediction"] = str(selected_action)
         try:
             write_manual_label_rows(
                 output_path, fieldnames, rows, valid_action_ids=action_mapping
@@ -2020,10 +2044,10 @@ def render_manual_labeling(
             f"Saved {clip_id} to {output_path.name}.",
         )
         if advance:
-            queue_clip(next_unlabeled_clip(clip_ids, rows, row_index))
+            queue_clip(next_unlabeled_clip(clip_ids, visible_rows, row_index))
 
     def clear_label() -> None:
-        rows[row_index]["prediction"] = ""
+        rows[table_index]["prediction"] = ""
         try:
             write_manual_label_rows(
                 output_path, fieldnames, rows, valid_action_ids=action_mapping
@@ -2036,8 +2060,8 @@ def render_manual_labeling(
             f"Cleared the label for {clip_id}.",
         )
 
-    previous_clip = clip_ids[(row_index - 1) % len(rows)]
-    next_clip = clip_ids[(row_index + 1) % len(rows)]
+    previous_clip = clip_ids[(row_index - 1) % len(clip_ids)]
+    next_clip = clip_ids[(row_index + 1) % len(clip_ids)]
     controls = st.columns((1, 1, 1.4, 1, 1))
     controls[0].button(
         "← Previous",

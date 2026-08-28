@@ -62,12 +62,18 @@ stopping the process.
 
 ### Label test clips manually
 
-Choose **Manual labeling** in the sidebar to review the active test CSV in
-submission order. The page shows the synchronized sensor player, action picker,
-labeling progress, previous/next navigation, and a shortcut to save and advance
-to the next unlabeled clip. It preserves the source CSV and atomically writes a
-resumable sibling file: `Testing/test.csv` becomes
-`Testing/test_manual_label.csv`.
+Choose **Manual labeling** in the sidebar to review test clips in submission
+order. The page shows the synchronized sensor player, action picker, labeling
+progress, previous/next navigation, and a shortcut to save and advance to the
+next unlabeled clip.
+
+Labels are recorded against the tracked test index, `Testing/test.csv`, and
+atomically written to a resumable sibling, `Testing/test_manual_label.csv`.
+Neither the index nor the dataset is modified. The sample dataset ships a
+subset of the same test clips, so selecting it narrows the page to the clips it
+can play rather than starting a second table — a label saved from either view
+is the same clip's label, and the page reports how much of the full index the
+active dataset reaches.
 
 The default output paths use the command-line layout, but every primary output
 can be renamed on Workflow:

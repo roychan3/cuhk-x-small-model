@@ -193,6 +193,37 @@ def write_manual_label_rows(
         temporary.unlink(missing_ok=True)
 
 
+def active_row_indices(
+    rows: Sequence[Mapping[str, object]],
+    active_test_csv: str | Path,
+) -> list[int]:
+    """Indices of ``rows`` that ``active_test_csv`` covers, in its own order.
+
+    The sample dataset indexes a subset of the real test clips, so a label
+    recorded while it is selected is a label for that same clip in a full run.
+    Both dataset choices therefore read and write one canonical table, and this
+    narrows it to the clips the active dataset can actually show. Keeping a
+    second table per dataset would let the two disagree about the same clip.
+    """
+
+    _fieldnames, active_rows = _read_rows(Path(active_test_csv).expanduser())
+    position = {
+        str(row.get("path", "") or "").strip(): index
+        for index, row in enumerate(rows)
+    }
+    indices: list[int] = []
+    for row in active_rows:
+        path = str(row.get("path", "") or "").strip()
+        index = position.get(path)
+        if index is None:
+            raise ValueError(
+                f"{active_test_csv} lists a clip the tracked test index does "
+                f"not contain: {path}"
+            )
+        indices.append(index)
+    return indices
+
+
 def _is_labeled(row: Mapping[str, object]) -> bool:
     return bool(str(row.get("prediction", "") or "").strip())
 

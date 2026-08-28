@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from visualization.manual_labels import (
+    active_row_indices,
     archive_manual_label_file,
     initial_label_clip,
     load_manual_label_rows,
@@ -154,6 +155,56 @@ class ManualLabelWriteBackTests(unittest.TestCase):
             # With the bad file out of the way the page can start over.
             _fields, rows = load_manual_label_rows(source, valid_action_ids=range(40))
             self.assertEqual([row["prediction"] for row in rows], ["", ""])
+
+
+class ActiveSubsetTests(unittest.TestCase):
+    """The sample dataset labels a slice of the tracked test index."""
+
+    CANONICAL = [
+        {"path": "small_model_track_test/SM_test_0001/", "prediction": "5"},
+        {"path": "small_model_track_test/SM_test_0002/", "prediction": ""},
+        {"path": "small_model_track_test/SM_test_0003/", "prediction": ""},
+    ]
+
+    def _write(self, directory: str, name: str, *clip_ids: str) -> Path:
+        path = Path(directory) / name
+        body = "".join(f"small_model_track_test/{c}/,\n" for c in clip_ids)
+        path.write_text(f"path,prediction\n{body}", encoding="utf-8")
+        return path
+
+    def test_subset_maps_onto_the_canonical_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            sample = self._write(temporary, "test.csv", "SM_test_0003", "SM_test_0001")
+
+            indices = active_row_indices(self.CANONICAL, sample)
+
+            # Order follows the active CSV, not the canonical table.
+            self.assertEqual(indices, [2, 0])
+
+    def test_full_index_maps_to_every_row(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            full = self._write(
+                temporary, "test.csv", "SM_test_0001", "SM_test_0002", "SM_test_0003"
+            )
+
+            self.assertEqual(active_row_indices(self.CANONICAL, full), [0, 1, 2])
+
+    def test_labels_recorded_for_a_sample_clip_are_visible_in_the_full_view(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            sample = self._write(temporary, "test.csv", "SM_test_0001")
+            rows = [dict(row) for row in self.CANONICAL]
+
+            index = active_row_indices(rows, sample)[0]
+
+            # One table, so the sample view writes the full run's row.
+            self.assertEqual(rows[index]["prediction"], "5")
+
+    def test_rejects_a_clip_missing_from_the_tracked_index(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            stray = self._write(temporary, "test.csv", "SM_test_9999")
+
+            with self.assertRaisesRegex(ValueError, "does not contain"):
+                active_row_indices(self.CANONICAL, stray)
 
 
 class ClipNavigationTests(unittest.TestCase):
