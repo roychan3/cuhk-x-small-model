@@ -1,5 +1,8 @@
 {
   "include": ["modeling", "scripts", "tests", "visualization"],
   "exclude": ["**/__pycache__", "artifacts", "Testing/data", "Training/data"],
-  "extraPaths": ["."]
+  "typeCheckingMode": "basic",
+  "extraPaths": ["."],
+  "venvPath": ".",
+  "venv": ".venv"
 }

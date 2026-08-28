@@ -354,3 +354,10 @@ marker file, and both of those directories hold a `requirements.txt`. Opening
 Adding `..` to the search path fixes that without moving the requirements
 files, which the Dockerfile and the install instructions above both reference
 by path. Editors that root correctly ignore the two nested files.
+
+Install the development requirements before running Pyright or opening the
+project in a Python language server:
+
+```bash
+pip install -r requirements-dev.txt
+```

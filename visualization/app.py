@@ -15,6 +15,7 @@ from collections import Counter
 from collections.abc import Iterable, Mapping
 from functools import lru_cache
 from pathlib import Path, PurePosixPath
+from typing import Any, cast
 
 # Streamlit adds this script's directory to sys.path, but not necessarily the
 # repository root when launched by absolute path or from another directory.
@@ -173,13 +174,19 @@ SkeletonAxisRanges = tuple[
 SkeletonBoneLengths = tuple[float, ...]
 
 
+def _coerce_int(value: object) -> int:
+    """Convert a validated scalar from pandas or decoded JSON to ``int``."""
+
+    return int(cast(Any, value))
+
+
 def natural_key(value: object) -> tuple[object, ...]:
     parts = re.split(r"(\d+)", "" if value is None else str(value))
     return tuple(int(part) if part.isdigit() else part.lower() for part in parts)
 
 
 def pretty_action(value: object) -> str:
-    if value is None or pd.isna(value):
+    if value is None or bool(pd.isna(cast(Any, value))):
         return "Unknown"
     text = str(value)
     if "_" in text and text.split("_", 1)[0].isdigit():
@@ -188,7 +195,7 @@ def pretty_action(value: object) -> str:
 
 
 def prediction_label(action_id: object, action_name: object) -> str:
-    return f"{int(action_id):02d} · {pretty_action(action_name)}"
+    return f"{_coerce_int(action_id):02d} · {pretty_action(action_name)}"
 
 
 def correctness_flag(value: object) -> bool | None:
@@ -199,7 +206,7 @@ def correctness_flag(value: object) -> bool | None:
     therefore never match; convert explicitly instead.
     """
 
-    if value is None or pd.isna(value):
+    if value is None or bool(pd.isna(cast(Any, value))):
         return None
     return bool(value)
 
@@ -255,7 +262,11 @@ def cached_saved_manifest(
                 lambda value: None if pd.isna(value) else str(value).strip().lower() == "true"
             )
     sources = discover_sources(dataset_root)
-    return frame.where(pd.notna(frame), None).to_dict("records"), {
+    records = cast(
+        list[dict[str, object]],
+        cast(Any, frame).where(pd.notna(frame), None).to_dict("records"),
+    )
+    return records, {
         split: source.to_dict() for split, source in sources.items()
     }
 
@@ -432,7 +443,8 @@ def render_overview(frame: pd.DataFrame) -> None:
                 x="action",
                 y="clips",
                 color="clips",
-                color_continuous_scale="Blues",
+                # Plotly accepts a named scale here; its stub says list[str].
+                color_continuous_scale="Blues",  # pyright: ignore[reportArgumentType]
                 hover_data=["action_id"],
             )
             figure.update_layout(xaxis_tickangle=-55, coloraxis_showscale=False, height=480)
@@ -459,8 +471,10 @@ def render_overview(frame: pd.DataFrame) -> None:
         figure = go.Figure(
             data=go.Heatmap(
                 z=heat.values,
-                x=[str(value) for value in heat.columns],
-                y=list(heat.index),
+                # Categorical axis labels are valid; the stub only admits
+                # numeric arrays and Series.
+                x=[str(value) for value in heat.columns],  # pyright: ignore[reportArgumentType]
+                y=list(heat.index),  # pyright: ignore[reportArgumentType]
                 colorscale="Viridis",
                 colorbar_title="clips",
             )
@@ -548,14 +562,19 @@ def _stabilize_skeleton_points(
     stabilized = [points[0], *([(0.0, 0.0, 0.0)] * (len(points) - 1))]
     for start, end, edge_index in SKELETON_EDGE_CHAIN:
         target_length = bone_lengths[edge_index]
-        direction = tuple(points[end][axis] - points[start][axis] for axis in range(3))
+        direction = (
+            points[end][0] - points[start][0],
+            points[end][1] - points[start][1],
+            points[end][2] - points[start][2],
+        )
         source_length = math.sqrt(sum(value * value for value in direction))
         if source_length <= 1e-8:
             stabilized[end] = stabilized[start]
             continue
-        stabilized[end] = tuple(
-            stabilized[start][axis] + direction[axis] * target_length / source_length
-            for axis in range(3)
+        stabilized[end] = (
+            stabilized[start][0] + direction[0] * target_length / source_length,
+            stabilized[start][1] + direction[1] * target_length / source_length,
+            stabilized[start][2] + direction[2] * target_length / source_length,
         )
     return stabilized
 
@@ -600,9 +619,21 @@ def imu_figure(payloads: dict[str, bytes], paths: list[str]) -> go.Figure | None
         text = payloads[path].decode("utf-8-sig", errors="replace")
         rows = list(csv.reader(io.StringIO(text)))
         for row in rows[1:]:
-            ax, ay, az = (_float_at(row, index) for index in (2, 3, 4))
-            gx, gy, gz = (_float_at(row, index) for index in (5, 6, 7))
-            if None in (ax, ay, az, gx, gy, gz) or len(row) < 2:
+            ax = _float_at(row, 2)
+            ay = _float_at(row, 3)
+            az = _float_at(row, 4)
+            gx = _float_at(row, 5)
+            gy = _float_at(row, 6)
+            gz = _float_at(row, 7)
+            if (
+                ax is None
+                or ay is None
+                or az is None
+                or gx is None
+                or gy is None
+                or gz is None
+                or len(row) < 2
+            ):
                 continue
             points.append(
                 {
@@ -1541,8 +1572,9 @@ def render_clip_player(
 
     # The whole clip travels to the browser in one document, so make its size
     # visible rather than letting a long clip quietly stall the connection.
-    if hasattr(st, "iframe"):
-        st.iframe(player_html, width="stretch", height=CLIP_PLAYER_HEIGHT, tab_index=0)
+    iframe = getattr(st, "iframe", None)
+    if callable(iframe):
+        iframe(player_html, width="stretch", height=CLIP_PLAYER_HEIGHT, tab_index=0)
     else:  # pragma: no cover - compatibility with Streamlit before 1.62
         components.html(player_html, height=CLIP_PLAYER_HEIGHT, scrolling=True)
     # The document is almost entirely base64, so its character count is within a
@@ -1725,7 +1757,9 @@ def render_clip_explorer(
             pred_filtered = filtered.dropna(subset=["prediction_action_id"])
             if not pred_filtered.empty:
                 prediction_options = {
-                    prediction_label(action_id, group["prediction_action_name"].iloc[0]): int(action_id)
+                    prediction_label(action_id, group["prediction_action_name"].iloc[0]): _coerce_int(
+                        action_id
+                    )
                     for action_id, group in pred_filtered.groupby("prediction_action_id")
                 }
                 selected_prediction = st.selectbox(
@@ -1751,7 +1785,9 @@ def render_clip_explorer(
         predicted = filtered.dropna(subset=["prediction_action_id"])
         if not predicted.empty:
             prediction_options = {
-                prediction_label(action_id, group["prediction_action_name"].iloc[0]): int(action_id)
+                prediction_label(action_id, group["prediction_action_name"].iloc[0]): _coerce_int(
+                    action_id
+                )
                 for action_id, group in predicted.groupby("prediction_action_id")
             }
             selected_prediction = st.selectbox(
@@ -1784,7 +1820,7 @@ def render_clip_explorer(
             return f"{clip_id} · true {true_label} · pred {pred_label} {mark}".strip()
         return f"{clip_id} · {pred_label}"
 
-    clip_id = st.selectbox("Clip", clip_ids, format_func=clip_label)
+    clip_id = cast(str, st.selectbox("Clip", clip_ids, format_func=clip_label))
     row = filtered[filtered["clip_id"] == clip_id].iloc[0]
 
     if "prediction_action_id" in row.index and pd.notna(row.get("prediction_action_id")):
@@ -2202,10 +2238,20 @@ def render_quality(frame: pd.DataFrame) -> None:
             figure.update_layout(height=max(400, 28 * len(issue_frame)), yaxis={"categoryorder": "total ascending"})
             st.plotly_chart(figure, width="stretch")
 
-    duration = pd.to_numeric(data.get("duration_seconds"), errors="coerce").dropna()
+    duration_values = data.get("duration_seconds")
+    duration = (
+        pd.to_numeric(duration_values, errors="coerce").dropna()
+        if duration_values is not None
+        else pd.Series(dtype=float)
+    )
     if not duration.empty:
         st.subheader("Clip duration distribution")
-        figure = px.histogram(duration, nbins=50, labels={"value": "seconds"})
+        figure = px.histogram(
+            # A Series is a supported input; the stub only names frames/dicts.
+            duration,  # pyright: ignore[reportArgumentType]
+            nbins=50,
+            labels={"value": "seconds"},
+        )
         figure.update_layout(showlegend=False, height=360)
         st.plotly_chart(figure, width="stretch")
 
@@ -2241,8 +2287,8 @@ def render_background_manifest_status(
                 pass
 
             phase = str(progress.get("stage", "starting"))
-            processed = int(progress.get("current", 0) or 0)
-            total = int(progress.get("total", 0) or 0)
+            processed = _coerce_int(progress.get("current", 0) or 0)
+            total = _coerce_int(progress.get("total", 0) or 0)
             if phase == "counting":
                 st.progress(
                     0.0,
@@ -2369,7 +2415,9 @@ def main() -> None:
 
     # Resolve the active workflow for every dataset-dependent page.
     root, workflow_test_csv, sample_selected = workflow_dataset_paths(
-        repository_root, default_root, st.session_state
+        repository_root,
+        default_root,
+        cast(Mapping[str, object], st.session_state),
     )
     dataset_root = str(root)
     st.session_state["dataset_root_input"] = dataset_root
@@ -2377,12 +2425,19 @@ def main() -> None:
     def open_workflow() -> None:
         st.session_state["page_selector"] = "Workflow"
 
+    effective_manifest = ""
+    progressive = True
+    deep_test = True
     with st.sidebar:
         st.markdown("**Active workflow**")
         st.caption(
             f"Dataset: {'sample' if sample_selected else 'full'} · `{dataset_root}`"
         )
-        st.button("Configure workflow", on_click=open_workflow, width="stretch")
+        st.button(
+            "Configure workflow",
+            on_click=open_workflow,
+            width="stretch",
+        )
 
         if page != "Manual labeling":
             default_manifest = (

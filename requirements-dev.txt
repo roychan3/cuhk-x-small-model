@@ -1,0 +1,4 @@
+# Development and static-analysis dependencies.
+-r requirements.txt
+basedpyright>=1.31,<2
+pandas-stubs>=2.2,<3
