@@ -1,5 +1,7 @@
 # Dependencies required by the visualization module.
-streamlit>=1.38,<2
+# 1.51 is the first release where st.plotly_chart accepts width=; st.button
+# took it in 1.48, so checking buttons alone gives a floor three releases low.
+streamlit>=1.51,<2
 pandas>=2.2,<3
 plotly>=5.24,<7
 Pillow>=10,<12
