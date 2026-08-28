@@ -243,3 +243,9 @@ artifacts/
 
 # Agent session exports
 trajectory-*.json
+
+# Atomic-write temporaries. visualization/manual_labels.py writes these beside
+# the active test CSV, which for the full dataset is the tracked Testing/
+# directory; a killed process leaks one instead of renaming it into place.
+.*.tmp.csv
+.*.tmp.json

@@ -44,6 +44,14 @@ from visualization.dataset import (
     read_members,
     resolve_dataset_root,
 )
+from visualization.manual_labels import (
+    archive_manual_label_file,
+    initial_label_clip,
+    load_manual_label_rows,
+    manual_label_path,
+    next_unlabeled_clip,
+    write_manual_label_rows,
+)
 from visualization.playback import (
     playback_interval,
     timeline_frame_count,
@@ -51,6 +59,7 @@ from visualization.playback import (
 )
 from visualization.predictions import (
     PredictionTable,
+    clip_id_from_submission_path,
     discover_prediction_csvs,
     load_action_mapping,
     load_prediction_csv,
@@ -285,6 +294,21 @@ def background_manifest_process(
 @st.cache_data(show_spinner=False)
 def cached_member_index(source_data: dict[str, str]) -> dict[str, dict[str, list[str]]]:
     return build_member_index(source_from_dict(source_data))
+
+
+@st.cache_data(show_spinner=False)
+def cached_sources(dataset_root: str) -> dict[str, dict[str, str]]:
+    """Split sources for pages that skip the manifest build.
+
+    The manifest helpers already return this alongside their records; manual
+    labeling needs it without paying for a dataset scan, and it reruns on every
+    button click, so the directory globs are cached here instead.
+    """
+
+    return {
+        split: source.to_dict()
+        for split, source in discover_sources(dataset_root).items()
+    }
 
 
 @st.cache_data(show_spinner=False)
@@ -1831,6 +1855,276 @@ def render_clip_explorer(
         st.json(metadata)
 
 
+def _offer_label_table_reset(output_path: Path, flash_key: str) -> None:
+    """Offer a way out when the manual-label file cannot be read.
+
+    Every path through the page needs that file to parse before anything
+    renders, so without this the only recovery from a corrupt or reordered
+    file is deleting it from a shell. Renaming keeps whatever it still holds.
+    """
+
+    if not output_path.is_file():
+        return
+    st.caption(
+        f"`{output_path}` is the file that could not be used. Moving it aside "
+        "keeps its contents and restarts labeling from a blank table."
+    )
+    if st.button(
+        "Move the manual-label file aside",
+        key=f"manual_label_reset::{output_path}",
+    ):
+        try:
+            backup = archive_manual_label_file(output_path)
+        except OSError as exc:
+            st.error(f"Could not move the file aside: {exc}")
+            return
+        st.session_state[flash_key] = (
+            "success",
+            f"Moved the unreadable label file to {backup.name}.",
+        )
+        st.rerun()
+
+
+def render_manual_labeling(
+    dataset_root: Path,
+    test_csv: Path,
+    sources: dict[str, dict[str, str]],
+) -> None:
+    """Render a resumable, one-clip-at-a-time test labeling page."""
+
+    st.header("Manual test-data labeling")
+    st.caption(
+        "Review each multimodal clip, assign one of the 40 actions, and save "
+        "without changing the original test index."
+    )
+
+    source_data = sources.get("test")
+    if source_data is None:
+        st.error("No test data source was found under the active dataset root.")
+        return
+    source = source_from_dict(source_data)
+    if not source.readable:
+        st.error("The test data source is not readable, so clips cannot be labeled.")
+        return
+    if not test_csv.is_file():
+        st.error(f"Test CSV does not exist: {test_csv}")
+        return
+
+    mapping_candidates = (
+        dataset_root / "Training" / "class_mapping.csv",
+        REPOSITORY_ROOT / "Training" / "class_mapping.csv",
+    )
+    mapping_path = next((path for path in mapping_candidates if path.is_file()), None)
+    if mapping_path is None:
+        st.error("Training/class_mapping.csv was not found in the dataset or repository.")
+        return
+
+    output_path = manual_label_path(test_csv)
+    scope = str(output_path.resolve())
+    selector_key = f"manual_label_clip::{scope}"
+    pending_key = f"manual_label_pending_clip::{scope}"
+    flash_key = f"manual_label_flash::{scope}"
+
+    try:
+        action_mapping = load_action_mapping(mapping_path)
+        fieldnames, rows = load_manual_label_rows(
+            test_csv,
+            output_path,
+            valid_action_ids=action_mapping,
+        )
+        clip_ids = [clip_id_from_submission_path(row["path"]) for row in rows]
+        if len(clip_ids) != len(set(clip_ids)):
+            raise ValueError("The test CSV contains duplicate clip IDs")
+    except Exception as exc:
+        st.error(f"Could not load the labeling table: {exc}")
+        _offer_label_table_reset(output_path, flash_key)
+        return
+    if not rows:
+        st.info("The active test CSV contains no clips.")
+        return
+
+    labeled_count = sum(bool(row["prediction"].strip()) for row in rows)
+    st.progress(labeled_count / len(rows))
+    st.caption(
+        f"{labeled_count:,} of {len(rows):,} clips labeled · source `{test_csv}` · "
+        f"output `{output_path}`"
+    )
+
+    pending_clip = st.session_state.pop(pending_key, None)
+    if pending_clip in clip_ids:
+        st.session_state[selector_key] = pending_clip
+    if st.session_state.get(selector_key) not in clip_ids:
+        st.session_state[selector_key] = initial_label_clip(clip_ids, rows)
+
+    flash = st.session_state.pop(flash_key, None)
+    if flash:
+        level, message = flash
+        getattr(st, level)(message)
+
+    row_by_clip = dict(zip(clip_ids, rows))
+
+    def clip_label(clip_id: str) -> str:
+        prediction = row_by_clip[clip_id]["prediction"].strip()
+        if not prediction:
+            return f"{clip_id} · unlabeled"
+        action_id = int(prediction)
+        return f"{clip_id} · {prediction_label(action_id, action_mapping[action_id])}"
+
+    clip_id = st.selectbox(
+        "Test clip",
+        clip_ids,
+        format_func=clip_label,
+        key=selector_key,
+    )
+    row_index = clip_ids.index(clip_id)
+    current_prediction = rows[row_index]["prediction"].strip()
+    current_action = int(current_prediction) if current_prediction else None
+    action_options: list[int | None] = [None, *sorted(action_mapping)]
+    # The saved prediction belongs in the key, not just in ``index``: a value
+    # already in session_state under a widget key overrides ``index``, so
+    # reusing one key per clip would keep showing the pre-save selection after
+    # a save or a clear. Because the key and the index derive from the same
+    # value, an unchanged key always implies an unchanged index.
+    action_key = (
+        f"manual_label_action::{scope}::{clip_id}::"
+        f"{current_prediction or 'blank'}"
+    )
+    selected_action = st.selectbox(
+        "Action label",
+        action_options,
+        index=action_options.index(current_action),
+        format_func=lambda value: (
+            "Choose an action…"
+            if value is None
+            else prediction_label(value, action_mapping[value])
+        ),
+        key=action_key,
+    )
+
+    def queue_clip(target_clip: str) -> None:
+        st.session_state[pending_key] = target_clip
+
+    def save_label(advance: bool) -> None:
+        if selected_action is None:
+            return
+        rows[row_index]["prediction"] = str(selected_action)
+        try:
+            write_manual_label_rows(
+                output_path, fieldnames, rows, valid_action_ids=action_mapping
+            )
+        except Exception as exc:
+            st.session_state[flash_key] = ("error", f"Could not save labels: {exc}")
+            return
+        st.session_state[flash_key] = (
+            "success",
+            f"Saved {clip_id} to {output_path.name}.",
+        )
+        if advance:
+            queue_clip(next_unlabeled_clip(clip_ids, rows, row_index))
+
+    def clear_label() -> None:
+        rows[row_index]["prediction"] = ""
+        try:
+            write_manual_label_rows(
+                output_path, fieldnames, rows, valid_action_ids=action_mapping
+            )
+        except Exception as exc:
+            st.session_state[flash_key] = ("error", f"Could not save labels: {exc}")
+            return
+        st.session_state[flash_key] = (
+            "success",
+            f"Cleared the label for {clip_id}.",
+        )
+
+    previous_clip = clip_ids[(row_index - 1) % len(rows)]
+    next_clip = clip_ids[(row_index + 1) % len(rows)]
+    controls = st.columns((1, 1, 1.4, 1, 1))
+    controls[0].button(
+        "← Previous",
+        on_click=queue_clip,
+        args=(previous_clip,),
+        width="stretch",
+    )
+    controls[1].button(
+        "Clear",
+        on_click=clear_label,
+        disabled=current_action is None,
+        width="stretch",
+    )
+    controls[2].button(
+        "Save & next unlabeled",
+        on_click=save_label,
+        args=(True,),
+        disabled=selected_action is None,
+        type="primary",
+        width="stretch",
+    )
+    controls[3].button(
+        "Save",
+        on_click=save_label,
+        args=(False,),
+        disabled=selected_action is None,
+        width="stretch",
+    )
+    controls[4].button(
+        "Next →",
+        on_click=queue_clip,
+        args=(next_clip,),
+        width="stretch",
+    )
+
+    if output_path.is_file():
+        st.download_button(
+            "Download manual labels",
+            data=output_path.read_bytes(),
+            file_name=output_path.name,
+            mime="text/csv",
+        )
+
+    with st.spinner("Indexing clip…"):
+        modalities = cached_clip_index(source_data, clip_id)
+    if not modalities:
+        st.warning(f"No sensor files were found for {clip_id}.")
+        return
+
+    counts = st.columns(6)
+    for column, modality in zip(counts, MODALITIES):
+        column.metric(modality, len(modalities.get(modality, ())))
+
+    imu_paths = modalities.get("IMU", [])
+    radar_paths = modalities.get("Radar", [])
+    skeleton_paths = modalities.get("Skeleton", [])
+    static_paths = tuple(dict.fromkeys([*imu_paths, *radar_paths]))
+    static_payloads = cached_payloads(source_data, static_paths) if static_paths else {}
+    if skeleton_paths:
+        skeleton_ranges, skeleton_bone_lengths = cached_skeleton_calibration(
+            source_data,
+            tuple(skeleton_paths),
+        )
+    else:
+        skeleton_ranges, skeleton_bone_lengths = None, None
+
+    render_clip_player(
+        modalities,
+        source_data,
+        static_payloads,
+        skeleton_ranges,
+        skeleton_bone_lengths,
+        f"manual-label:test:{clip_id}",
+        None,
+    )
+
+    st.subheader("IMU magnitude traces")
+    if imu_paths:
+        figure = imu_figure(static_payloads, imu_paths)
+        if figure is not None:
+            st.plotly_chart(figure, width="stretch")
+        else:
+            st.info("IMU files exist but contain no usable samples.")
+    else:
+        st.info("IMU unavailable.")
+
+
 def render_quality(frame: pd.DataFrame) -> None:
     st.header("Data quality")
     split = st.selectbox("Quality split", sorted(frame["split"].unique()), key="quality_split")
@@ -2018,6 +2312,7 @@ def main() -> None:
                 "Workflow",
                 "Overview",
                 "Clip explorer",
+                "Manual labeling",
                 "Data quality",
                 "Algorithm comparison",
             ),
@@ -2030,6 +2325,8 @@ def main() -> None:
                 st.rerun()
         elif page == "Workflow":
             st.caption("Choose data once, then extract, train, predict, and visualize.")
+        elif page == "Manual labeling":
+            st.caption("Assign action labels to test clips and save a resumable CSV.")
         else:
             st.caption(
                 "A saved manifest loads instantly; otherwise the first 200 clips "
@@ -2046,65 +2343,84 @@ def main() -> None:
         )
         return
 
-    # Only for the three dataset-dependent pages
-    default_manifest = str(generated_manifest) if generated_manifest.is_file() else ""
-    if "saved_manifest_input" not in st.session_state:
-        st.session_state["saved_manifest_input"] = default_manifest
-    if "use_manifest_checkbox" not in st.session_state:
-        st.session_state["use_manifest_checkbox"] = True
-    root, _workflow_test_csv, sample_selected = workflow_dataset_paths(
+    # Resolve the active workflow for every dataset-dependent page.
+    root, workflow_test_csv, sample_selected = workflow_dataset_paths(
         repository_root, default_root, st.session_state
     )
     dataset_root = str(root)
     st.session_state["dataset_root_input"] = dataset_root
+
+    def open_workflow() -> None:
+        st.session_state["page_selector"] = "Workflow"
+
     with st.sidebar:
         st.markdown("**Active workflow**")
         st.caption(
             f"Dataset: {'sample' if sample_selected else 'full'} · `{dataset_root}`"
         )
-
-        def open_workflow() -> None:
-            st.session_state["page_selector"] = "Workflow"
-
         st.button("Configure workflow", on_click=open_workflow, width="stretch")
-        # Pre-filled with the generated parquet when it exists. Clearing the
-        # field or unchecking below enables progressive/background rebuilding.
-        saved_manifest = st.text_input(
-            "Saved manifest (optional)", key="saved_manifest_input"
-        ).strip()
-        use_manifest = st.checkbox(
-            "Use saved manifest",
-            disabled=not saved_manifest or sample_selected,
-            help=(
-                "Uncheck to rebuild from the dataset. Saved full-dataset manifests "
-                "are not applied to the sample dataset."
-            ),
-            key="use_manifest_checkbox",
-        )
-        effective_manifest = saved_manifest if use_manifest and not sample_selected else ""
-        progressive = st.checkbox(
-            f"Load {INITIAL_CLIP_LIMIT} clips first",
-            value=True,
-            disabled=bool(effective_manifest),
-            help=(
-                "Show a representative subset immediately while a complete "
-                "manifest is built in the background."
-            ),
-            key="progressive_loading_checkbox",
-        )
-        deep_test = st.checkbox(
-            "Inspect test CSV/JSON quality",
-            value=True,
-            disabled=bool(effective_manifest),
-            key="deep_test_checkbox",
-        )
 
-        if st.button("Clear cached index", key="clear_cache_main"):
-            st.cache_data.clear()
-            # Also drops a finished or failed background builder, so this is the
-            # retry path when the complete index could not be written.
-            st.cache_resource.clear()
-            st.rerun()
+        if page != "Manual labeling":
+            default_manifest = (
+                str(generated_manifest) if generated_manifest.is_file() else ""
+            )
+            if "saved_manifest_input" not in st.session_state:
+                st.session_state["saved_manifest_input"] = default_manifest
+            if "use_manifest_checkbox" not in st.session_state:
+                st.session_state["use_manifest_checkbox"] = True
+
+            # Pre-filled with the generated parquet when it exists. Clearing the
+            # field or unchecking below enables progressive/background rebuilding.
+            saved_manifest = st.text_input(
+                "Saved manifest (optional)", key="saved_manifest_input"
+            ).strip()
+            use_manifest = st.checkbox(
+                "Use saved manifest",
+                disabled=not saved_manifest or sample_selected,
+                help=(
+                    "Uncheck to rebuild from the dataset. Saved full-dataset manifests "
+                    "are not applied to the sample dataset."
+                ),
+                key="use_manifest_checkbox",
+            )
+            effective_manifest = (
+                saved_manifest if use_manifest and not sample_selected else ""
+            )
+            progressive = st.checkbox(
+                f"Load {INITIAL_CLIP_LIMIT} clips first",
+                value=True,
+                disabled=bool(effective_manifest),
+                help=(
+                    "Show a representative subset immediately while a complete "
+                    "manifest is built in the background."
+                ),
+                key="progressive_loading_checkbox",
+            )
+            deep_test = st.checkbox(
+                "Inspect test CSV/JSON quality",
+                value=True,
+                disabled=bool(effective_manifest),
+                key="deep_test_checkbox",
+            )
+
+            if st.button("Clear cached index", key="clear_cache_main"):
+                st.cache_data.clear()
+                # Also drops a finished or failed background builder, so this is the
+                # retry path when the complete index could not be written.
+                st.cache_resource.clear()
+                st.rerun()
+
+    if page == "Manual labeling":
+        if not root.is_dir():
+            st.error(f"Dataset root does not exist: {root}")
+            return
+        try:
+            label_sources = cached_sources(dataset_root)
+        except Exception as exc:
+            st.error(f"Could not discover the test data: {exc}")
+            return
+        render_manual_labeling(root, workflow_test_csv, label_sources)
+        return
 
     root = Path(dataset_root).expanduser()
     if not root.is_dir():

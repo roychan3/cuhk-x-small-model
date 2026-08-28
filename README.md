@@ -128,6 +128,8 @@ This repository includes a Streamlit dashboard with:
 - synchronized Depth Color, IR, and Thermal frames with play, pause, restart,
   speed, and manual scrubbing controls; playback stays in one browser component
   so advancing a frame does not remount the images or 3D viewers;
+- a **Manual labeling** page that reviews test clips one at a time and saves
+  action IDs beside the active test CSV as `*_manual_label.csv`;
 - animated 3D skeletons, IMU magnitude traces, and radar point clouds;
 - one **Workflow** page for choosing the sample or full dataset, extracting a
   named feature cache, training to explicit model/submission paths, and running
@@ -149,9 +151,10 @@ CUHKX_DATASET_ROOT=/path/to/small-model streamlit run visualization/app.py
 
 Open **Workflow** and choose **Sample dataset** or **Full dataset** once. The
 same dataset selection is then used by feature extraction, training,
-prediction, Overview, Data quality, and Clip explorer. Each stage has its own
-run button and explicit output path. Background feature/training runs keep live
-progress and timestamped logs under `artifacts/training_runs/`.
+prediction, Overview, Data quality, Clip explorer, and Manual labeling. Each
+workflow stage has its own run button and explicit output path. Background
+feature/training runs keep live progress and timestamped logs under
+`artifacts/training_runs/`.
 
 For a quick end-to-end check without processing the full dataset, create the
 ignored local fixture once:
@@ -302,7 +305,7 @@ Run it from the repository root:
 python3 -m unittest discover -s tests -t .
 ```
 
-There are seven suites with different requirements:
+There are eight suites with different requirements:
 
 | Suite | Tests | Requires | Behavior without the requirement |
 |-------|-------|----------|----------------------------------|
@@ -310,12 +313,13 @@ There are seven suites with different requirements:
 | `tests/test_predictions.py` | 9 | standard library only | always runs |
 | `tests/test_training_pipeline.py` | 29 | standard library only | always runs |
 | `tests/test_comparison_format.py` | 13 | standard library only | always runs; its 2 CLI-parity tests skip without `modeling/requirements.txt` |
+| `tests/test_manual_labels.py` | 18 | standard library only | always runs |
 | `tests/test_model_predictions.py` | 39 | artifact discovery and CSV round-tripping need the standard library only; the rest need `numpy`, `visualization/requirements.txt` (for `visualization.app`), or `modeling/requirements.txt` | 5 tests always run; the other 34 skip. Dataset I/O is mocked throughout, so no suite needs the dataset |
 | `tests/test_algorithm_comparison.py` | 19 | `visualization/requirements.txt` + `numpy` (for confusion-matrix math) | collapses to 1 skip |
 | `tests/test_modeling.py` | 32 | `modeling/requirements.txt` | collapses to 1 skip |
 
-So a bare interpreter reports `Ran 108 tests ... OK (skipped=37)`, while an
-interpreter with `visualization` + `modeling` deps reports `Ran 157 tests ... OK`
+So a bare interpreter reports `Ran 126 tests ... OK (skipped=37)`, while an
+interpreter with `visualization` + `modeling` deps reports `Ran 175 tests ... OK`
 (`skipped=1` when the optional real validation artifact is absent). A skip is
 expected, not a failure. Install the extras to run
 everything:

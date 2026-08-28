@@ -5,7 +5,8 @@ dataset and comparing training algorithms.
 
 ## Contents
 
-- `app.py`: Streamlit application — Workflow, Overview, Clip explorer, Data quality, and Algorithm comparison pages.
+- `app.py`: Streamlit application — Workflow, Overview, Clip explorer, Manual labeling, Data quality, and Algorithm comparison pages.
+- `manual_labels.py`: resumable manual-label CSV loading, symmetric read/write validation, atomic persistence, and clip-navigation helpers.
 - `training_pipeline.py`: shared dataset/feature/training/prediction workflow, background training runner, repo-local output validation, live stage progress, persistent logs, and reusable saved-run discovery.
 - `progress.py`: shared atomic JSON progress writer used by manifest building and model training.
 - `algorithm_comparison.py`: Algorithm comparison page (reads `artifacts/*/validation.json` from `modeling.train`/`modeling.compare`; no `scikit-learn` needed).
@@ -53,10 +54,20 @@ explorer is needed and the modeling actions on Workflow may remain unavailable.
 
 Choose **Workflow** in the sidebar. Select **Sample dataset** or **Full
 dataset** once, then use the separate buttons for feature extraction, training,
-and prediction. Each stage exposes its output path on the same page, and
-Overview/Clip explorer automatically use the selected dataset and saved
-prediction CSV. Feature extraction and training continue in the background;
-you can leave the page and return without stopping the process.
+and prediction. Each stage exposes its output path on the same page. Overview,
+Clip explorer, and Manual labeling automatically use the selected dataset, and
+Clip explorer also uses the saved prediction CSV. Feature extraction and
+training continue in the background; you can leave the page and return without
+stopping the process.
+
+### Label test clips manually
+
+Choose **Manual labeling** in the sidebar to review the active test CSV in
+submission order. The page shows the synchronized sensor player, action picker,
+labeling progress, previous/next navigation, and a shortcut to save and advance
+to the next unlabeled clip. It preserves the source CSV and atomically writes a
+resumable sibling file: `Testing/test.csv` becomes
+`Testing/test_manual_label.csv`.
 
 The default output paths use the command-line layout, but every primary output
 can be renamed on Workflow:
