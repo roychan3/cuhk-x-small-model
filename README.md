@@ -337,3 +337,20 @@ Run a single module verbosely:
 python3 -m unittest tests.test_visualization_dataset -v
 ```
 
+## Editor setup
+
+Every module imports from the repository root (`from visualization.dataset
+import ...`), which works because the entry points run from there and
+`visualization/app.py` puts the root on `sys.path` before its first-party
+imports. A language server does neither, so it has to be told where the root
+is.
+
+`pyrightconfig.json` at the root does that for editors that open the project
+as a whole. The two copies in `visualization/` and `modeling/` exist because
+most editors start the language server at the *nearest* directory containing a
+marker file, and both of those directories hold a `requirements.txt`. Opening
+`visualization/app.py` therefore roots the server at `visualization/`, where
+`visualization.dataset` cannot resolve and every first-party import is flagged.
+Adding `..` to the search path fixes that without moving the requirements
+files, which the Dockerfile and the install instructions above both reference
+by path. Editors that root correctly ignore the two nested files.
